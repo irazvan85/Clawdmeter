@@ -26,3 +26,9 @@ bool splash_is_active(void);
 
 // Root container (so ui.cpp can attach a click event).
 lv_obj_t* splash_get_root(void);
+
+// Copilot screen pixel-art animation (60x60, 3x scale).
+// splash_copilot_init() creates a canvas widget inside `parent` and allocates its buffer.
+// splash_copilot_tick() advances the frame if the hold time has elapsed.
+void splash_copilot_init(lv_obj_t* parent);
+void splash_copilot_tick(void);

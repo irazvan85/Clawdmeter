@@ -2,20 +2,20 @@
 #include "splash_animations.h"
 #include "theme.h"
 #include "usage_rate.h"
+#include "display_cfg.h"
 #include <Arduino.h>
 #include <string.h>
-#include <esp_heap_caps.h>
 
-// 20x20 grid scaled 24x to fill 480x480
+// 20x20 grid scaled to fit display width (CELL = floor(LCD_WIDTH / GRID))
 #define GRID         20
-#define CELL         24
+#define CELL         (LCD_WIDTH / GRID)   // 135/20 = 6 -> 120x120 canvas
 #define CANVAS_W     (GRID * CELL)
 #define CANVAS_H     (GRID * CELL)
 
 // Background fallback when palette is missing
 #define COL_EMPTY    0x0000  // true black (matches THEME_BG)
 
-LV_FONT_DECLARE(font_styrene_28);
+LV_FONT_DECLARE(font_styrene_14);
 
 static lv_obj_t *splash_container = NULL;
 static lv_obj_t *canvas = NULL;
@@ -68,20 +68,83 @@ static void resolve_group_lists(void) {
     }
 }
 
-static void render_frame(const uint8_t *cells, const uint16_t *palette) {
+// Generic renderer — draws any 20×20 frame into an arbitrary canvas buffer.
+// canvas_w must equal GRID * cell. Invalidates cvs when done.
+static void render_frame_to(uint16_t* buf, lv_obj_t* cvs, int canvas_w, int cell,
+                             const uint8_t* cells, const uint16_t* palette) {
+    uint16_t row[GRID * 6];  // max cell=6 → 120 pixels
     for (int gy = 0; gy < GRID; gy++) {
-        uint16_t row[CANVAS_W];
         for (int gx = 0; gx < GRID; gx++) {
             uint8_t code = cells[gy * GRID + gx];
             uint16_t color = (palette && code < SPLASH_PALETTE_SIZE) ? palette[code] : COL_EMPTY;
-            uint16_t *p = &row[gx * CELL];
-            for (int i = 0; i < CELL; i++) p[i] = color;
+            uint16_t *p = &row[gx * cell];
+            for (int i = 0; i < cell; i++) p[i] = color;
         }
-        for (int dy = 0; dy < CELL; dy++) {
-            memcpy(&canvas_buf[(gy * CELL + dy) * CANVAS_W], row, CANVAS_W * 2);
+        for (int dy = 0; dy < cell; dy++) {
+            memcpy(&buf[(gy * cell + dy) * canvas_w], row, canvas_w * 2);
         }
     }
-    if (canvas) lv_obj_invalidate(canvas);
+    if (cvs) lv_obj_invalidate(cvs);
+}
+
+static void render_frame(const uint8_t *cells, const uint16_t *palette) {
+    render_frame_to(canvas_buf, canvas, CANVAS_W, CELL, cells, palette);
+}
+
+// ---- Copilot canvas (60x60 @ 3x scale) ----
+#define COPILOT_CELL     3
+#define COPILOT_CANVAS_W (GRID * COPILOT_CELL)   // 60
+#define COPILOT_CANVAS_H (GRID * COPILOT_CELL)   // 60
+
+static lv_obj_t*  copilot_canvas     = NULL;
+static uint16_t*  copilot_canvas_buf = NULL;
+static int16_t    copilot_anim_idx   = -1;  // index into splash_anims[]
+static uint16_t   copilot_frame_idx  = 0;
+static uint32_t   copilot_frame_ms   = 0;
+
+void splash_copilot_init(lv_obj_t* parent) {
+    copilot_canvas_buf = (uint16_t*)malloc(COPILOT_CANVAS_W * COPILOT_CANVAS_H * 2);
+    if (!copilot_canvas_buf) {
+        Serial.println("splash: copilot canvas alloc failed");
+        return;
+    }
+    memset(copilot_canvas_buf, 0, COPILOT_CANVAS_W * COPILOT_CANVAS_H * 2);
+
+    copilot_canvas = lv_canvas_create(parent);
+    lv_canvas_set_buffer(copilot_canvas, copilot_canvas_buf,
+                         COPILOT_CANVAS_W, COPILOT_CANVAS_H, LV_COLOR_FORMAT_RGB565);
+    lv_obj_align(copilot_canvas, LV_ALIGN_BOTTOM_MID, 0, -4);
+
+    // Find "copilot idle" animation by name
+    copilot_anim_idx = -1;
+    for (int i = 0; i < SPLASH_ANIM_COUNT; i++) {
+        if (strcmp(splash_anims[i].name, "copilot idle") == 0) {
+            copilot_anim_idx = (int16_t)i;
+            break;
+        }
+    }
+    if (copilot_anim_idx < 0) {
+        Serial.println("splash: 'copilot idle' animation not found");
+        return;
+    }
+    const splash_anim_def_t* a = &splash_anims[copilot_anim_idx];
+    render_frame_to(copilot_canvas_buf, copilot_canvas,
+                    COPILOT_CANVAS_W, COPILOT_CELL, a->frames[0], a->palette);
+    copilot_frame_idx = 0;
+    copilot_frame_ms  = millis();
+}
+
+void splash_copilot_tick(void) {
+    if (copilot_anim_idx < 0 || !copilot_canvas_buf) return;
+    const splash_anim_def_t* a = &splash_anims[copilot_anim_idx];
+    if (a->frame_count == 0) return;
+    if (millis() - copilot_frame_ms >= a->holds[copilot_frame_idx]) {
+        copilot_frame_idx = (copilot_frame_idx + 1) % a->frame_count;
+        copilot_frame_ms  = millis();
+        render_frame_to(copilot_canvas_buf, copilot_canvas,
+                        COPILOT_CANVAS_W, COPILOT_CELL,
+                        a->frames[copilot_frame_idx], a->palette);
+    }
 }
 
 static void show_placeholder() {
@@ -92,14 +155,14 @@ static void show_placeholder() {
 }
 
 void splash_init(lv_obj_t *parent) {
-    canvas_buf = (uint16_t*)heap_caps_malloc(CANVAS_W * CANVAS_H * 2, MALLOC_CAP_SPIRAM);
+    canvas_buf = (uint16_t*)malloc(CANVAS_W * CANVAS_H * 2);
     if (!canvas_buf) {
         Serial.println("splash: failed to alloc canvas buffer");
         return;
     }
 
     splash_container = lv_obj_create(parent);
-    lv_obj_set_size(splash_container, 480, 480);
+    lv_obj_set_size(splash_container, LCD_WIDTH, LCD_HEIGHT);
     lv_obj_set_pos(splash_container, 0, 0);
     lv_obj_set_style_bg_color(splash_container, THEME_BG, 0);
     lv_obj_set_style_bg_opa(splash_container, LV_OPA_COVER, 0);
@@ -117,7 +180,7 @@ void splash_init(lv_obj_t *parent) {
         "no animations loaded\n\n"
         "run tools/scrape_claudepix.js\n"
         "then tools/convert_to_c.js");
-    lv_obj_set_style_text_font(label_status, &font_styrene_28, 0);
+    lv_obj_set_style_text_font(label_status, &font_styrene_14, 0);
     lv_obj_set_style_text_color(label_status, lv_color_hex(0xb0aea5), 0);
     lv_obj_set_style_text_align(label_status, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_center(label_status);

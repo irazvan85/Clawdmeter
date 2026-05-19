@@ -84,7 +84,7 @@ function main() {
   const entries = [];
 
   for (const meta of index) {
-    const ident = safeIdent(meta.filename.replace(/\.html?$/, ''));
+    const ident = safeIdent(meta.filename.replace(/\.(html?|json)$/, ''));
     const dataPath = path.join(IN_DIR, meta.filename.replace(/\.html?$/, '.json'));
     const data = JSON.parse(fs.readFileSync(dataPath, 'utf8'));
 

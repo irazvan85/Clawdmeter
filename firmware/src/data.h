@@ -10,3 +10,13 @@ struct UsageData {
     bool ok;                 // data parse succeeded
     bool valid;              // false until first successful parse
 };
+
+struct CopilotData {
+    int premium_pct;          // 0-100, % of monthly premium requests USED, -1 if unavailable
+    int premium_remaining;    // requests remaining this month, -1 if unavailable
+    int premium_total;        // monthly entitlement, -1 if unavailable
+    int premium_reset_mins;   // minutes until monthly quota reset, -1 if unknown
+    char plan[20];            // "individual", "business", "enterprise", "unknown"
+    bool enabled;             // Copilot seat is active
+    bool valid;               // false until first successful parse
+};

@@ -89,5 +89,12 @@
     "category": "Dance",
     "frame_count": 16,
     "palette_size": 10
+  },
+  {
+    "filename": "copilot_idle.json",
+    "name": "copilot idle",
+    "category": "Copilot",
+    "frame_count": 4,
+    "palette_size": 5
   }
 ]

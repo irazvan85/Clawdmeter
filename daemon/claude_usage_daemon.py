@@ -15,6 +15,7 @@ import signal
 import subprocess
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import httpx
@@ -27,6 +28,7 @@ RX_CHAR_UUID = "4c41555a-4465-7669-6365-000000000002"
 REQ_CHAR_UUID = "4c41555a-4465-7669-6365-000000000004"
 
 POLL_INTERVAL = 60
+COPILOT_POLL_INTERVAL = 300  # 5 minutes
 TICK = 5
 SCAN_TIMEOUT = 8.0
 
@@ -52,6 +54,89 @@ API_BODY = {
 
 def log(msg: str) -> None:
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+def read_github_token() -> str | None:
+    """Get GitHub auth token via `gh auth token` CLI."""
+    try:
+        result = subprocess.run(
+            ["gh", "auth", "token"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0:
+            token = result.stdout.strip()
+            if token:
+                return token
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+    return None
+
+
+async def poll_copilot(gh_token: str) -> dict | None:
+    """Poll /copilot_internal/user for premium request quota.
+
+    Returns quota_snapshots.premium_interactions (percent_remaining, remaining,
+    entitlement) and quota_reset_date_utc. Works for individual Copilot Pro plan.
+    """
+    headers = {
+        "Authorization": f"token {gh_token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    result: dict = {
+        "src": "copilot",
+        "en": False,
+        "plan": "unknown",
+        "pp": -1,   # premium_pct_used (0-100)
+        "pr": -1,   # premium_remaining
+        "pe": -1,   # premium_entitlement (total)
+        "prm": -1,  # minutes until quota reset
+        "ok": True,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as http:
+            resp = await http.get(
+                "https://api.github.com/copilot_internal/user", headers=headers
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                result["en"] = True
+                result["plan"] = data.get("copilot_plan", "individual")
+
+                # premium_interactions quota
+                pi = (data.get("quota_snapshots") or {}).get("premium_interactions") or {}
+                pct_rem = pi.get("percent_remaining", -1)
+                if pct_rem >= 0:
+                    result["pp"] = int(round(100 - pct_rem))
+                remaining = pi.get("remaining", -1)
+                if isinstance(remaining, (int, float)) and remaining >= 0:
+                    result["pr"] = int(remaining)
+                entitlement = pi.get("entitlement", -1)
+                if isinstance(entitlement, (int, float)) and entitlement > 0:
+                    result["pe"] = int(entitlement)
+
+                # Minutes until monthly reset
+                reset_date = data.get("quota_reset_date_utc") or data.get("quota_reset_date")
+                if reset_date:
+                    try:
+                        if "T" in reset_date:
+                            reset_dt = datetime.fromisoformat(reset_date.replace("Z", "+00:00"))
+                        else:
+                            reset_dt = datetime.fromisoformat(reset_date + "T00:00:00+00:00")
+                        mins = int((reset_dt - datetime.now(timezone.utc)).total_seconds() / 60)
+                        result["prm"] = max(0, mins)
+                    except Exception:
+                        pass
+            elif resp.status_code == 404:
+                log("Copilot: /copilot_internal/user returned 404")
+    except httpx.HTTPError as e:
+        log(f"Copilot API error: {e}")
+        result["ok"] = False
+    log(
+        f"Copilot: plan={result['plan']} enabled={result['en']} "
+        f"premium={result['pp']}% remaining={result['pr']}/{result['pe']} reset_mins={result['prm']}"
+    )
+    return result
 
 
 def _extract_access_token(blob: str) -> str | None:
@@ -247,6 +332,7 @@ async def connect_and_run(address: str, stop_event: asyncio.Event) -> bool:
     await session.setup_refresh_subscription()
 
     last_poll = 0.0
+    last_copilot_poll = 0.0
     used_successfully = False
     try:
         while client.is_connected and not stop_event.is_set():
@@ -268,6 +354,18 @@ async def connect_and_run(address: str, stop_event: asyncio.Event) -> bool:
                 await asyncio.wait_for(session.refresh_requested.wait(), timeout=TICK)
             except asyncio.TimeoutError:
                 pass
+
+            # GitHub Copilot poll every 5 minutes
+            now = time.time()
+            if now - last_copilot_poll >= COPILOT_POLL_INTERVAL:
+                last_copilot_poll = now
+                gh_token = read_github_token()
+                if gh_token:
+                    cp_payload = await poll_copilot(gh_token)
+                    if cp_payload is not None:
+                        await session.write_payload(cp_payload)
+                else:
+                    log("No GitHub token (install gh CLI and run 'gh auth login'); skipping Copilot poll")
     finally:
         try:
             await client.disconnect()

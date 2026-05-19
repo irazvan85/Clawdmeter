@@ -1,66 +1,68 @@
 # Project context
 
-ESP32-S3 firmware for a desk-side Claude Code usage monitor on a **Waveshare ESP32-S3-Touch-AMOLED-2.16** board (480×480 square AMOLED). Connects to a host daemon over BLE; daemon polls Anthropic API for usage data.
+ESP32 firmware for a desk-side Claude Code usage monitor on an **ideaspark ESP32 1.14" ST7789** board (135×240 IPS SPI LCD). Connects to a host daemon over BLE; daemon polls Anthropic API for usage data.
 
 This file is for future Claude Code sessions to bootstrap quickly. Read this first.
 
 ## Hardware (critical pins)
 
-- Display: **CO5300** AMOLED via QSPI (CS=12, SCLK=38, SDIO0..3=4..7, RST=2)
-- Touch: **CST9220** via I2C (SDA=15, SCL=14, INT=11, addr=0x5A)
-- PMU: **AXP2101** on same I2C bus (addr=0x34) — battery, USB VBUS, PWR button IRQ
-- IMU: **QMI8658** on same I2C bus (addr=0x6B) — accelerometer for auto-rotation
-- Buttons: GPIO 0 (left → Space/voice-mode), GPIO 18 (right → Shift+Tab/mode-toggle), AXP PKEY (middle → cycle screens; on splash → cycle animations)
+- MCU: **ESP32-WROOM-32** (240 MHz, 320 KB SRAM, 4 MB Flash, **no PSRAM**, BLE 4.2)
+- Display: **ST7789** 135×240 IPS via SPI — MOSI=23, SCLK=18, CS=15, DC=2, RST=4, BLK=32
+- Touch: **none**
+- PMU: **none** (no battery, no AXP)
+- IMU: **none** (no auto-rotation; rotation fixed at 0)
+- USB-serial: CH340 on **COM13** (Windows)
+- Buttons: GPIO 0 (back/left button only). GPIO 18 is LCD SCLK — **cannot be used as button**.
 
 ## Architecture
 
 ```text
-main.cpp        — setup(), loop(), button polling (left→Space, right→Shift+Tab, mid→cycle), rotation flash
-display_cfg.h   — pin defines, extern object decls
-ui.{h,cpp}      — 3-screen UI (splash, usage, bluetooth); splash is touch-toggled, usage↔bluetooth via mid button
-splash.{h,cpp}  — 20×20 pixel-art animation engine, 24× upscale to 480×480
-imu.{h,cpp}     — accelerometer-driven rotation tracker (returns 0..3)
-power.{h,cpp}   — AXP2101 wrapper (battery %, charging, VBUS, PWR button)
-touch.{h,cpp}   — minimal tap detector → ui_toggle_splash() (Usage/Splash) or ble_clear_bonds() (BT reset zone)
-ble.{h,cpp}     — NimBLE peripheral: custom data service + HID keyboard
-data.h          — UsageData struct
-icons.h         — icon arrays. Battery (5×) are RGB565A8 with alpha; rest are raw RGB565.
-logo.h          — 80×80 RGB565 logo
-font_*.c        — pre-compiled LVGL 9 bitmap fonts (Tiempos 56, Styrene 48/28/24/20, Mono 32)
+main.cpp        — setup(), loop(), BTN_BACK (GPIO0) polling, serial commands (screenshot, etc.)
+display_cfg.h   — pin defines (ST7789 SPI), LCD_WIDTH=135, LCD_HEIGHT=240, extern bus/gfx objects
+ui.{h,cpp}      — 3-screen UI (splash, usage, bluetooth); redesigned for 135×240
+splash.{h,cpp}  — 20×20 pixel-art animation engine, 6× upscale to 120×120 canvas
+imu.{h,cpp}     — stub: imu_get_rotation() always returns 0
+power.{h,cpp}   — stub: battery=-1, charging=false, pwr_pressed=false
+ble.{h,cpp}     — NimBLE peripheral: custom data service + HID keyboard (unchanged)
+data.h          — UsageData struct (unchanged)
+icons.h         — icon arrays (RGB565)
+logo.h          — 80×80 RGB565 logo (hidden at runtime — too wide for 135px)
+font_*.c        — LVGL 9 bitmap fonts in use: Tiempos 34, Styrene 24/16/14/12, Mono 18
 splash_animations.h — generated, do not hand-edit
 ```
 
-## Build / flash
+## Build / flash (Windows)
 
-```bash
-pio run -d firmware                                       # build
-pio run -d firmware -t upload --upload-port /dev/ttyACM0  # flash (binary path uses USB JTAG)
+```powershell
+# Build
+& "$env:USERPROFILE\.platformio\penv\Scripts\pio.exe" run -d firmware
+
+# Flash
+& "$env:USERPROFILE\.platformio\penv\Scripts\pio.exe" run -d firmware -t upload --upload-port COM13
 ```
 
-`/home/hermann/.platformio/penv/bin/pio` if `pio` isn't on PATH.
-
-Device shows up as `/dev/ttyACM0` (Espressif USB JTAG/serial debug unit). No boot-mode gymnastics needed — direct flash works.
+Device is on COM13 via CH340 USB-serial. Hold BOOT (GPIO0) while pressing EN if the chip doesn't enter download mode automatically (rarely needed).
 
 ## QA your own UI changes — don't ask the user
 
-The firmware ships a `screenshot` serial command that dumps the LVGL framebuffer over `/dev/ttyACM0`. `./screenshot.sh out.png /dev/ttyACM0` captures a 480×480 PNG. **Use this on every UI iteration** — Read the PNG with the Read tool, verify the change visually, iterate.
+The firmware ships a `screenshot` serial command that dumps the LVGL framebuffer over the serial port. `./screenshot.sh out.png COM13` (or the Windows equivalent) captures a 135×240 PNG. **Use this on every UI iteration** — read the PNG, verify visually, iterate.
 
-The boot screen is `SCREEN_SPLASH` and only advances on a physical button press, so a fresh flash will sit on the splash. To screenshot the screen you're actually editing without asking the user to press a button, **temporarily change the default boot screen** in `main.cpp` (search for `ui_show_screen(SCREEN_SPLASH);`) to `SCREEN_USAGE` / `SCREEN_CONTROLLER` / `SCREEN_BLUETOOTH`, do your iteration, then revert before committing.
+The boot screen is `SCREEN_SPLASH` and only advances on a physical button press. To screenshot a different screen without asking the user to press a button, **temporarily change the default boot screen** in `main.cpp` (search for `ui_show_screen(SCREEN_SPLASH);`) to `SCREEN_USAGE` / `SCREEN_BLUETOOTH`, iterate, then revert before committing.
 
 ## Critical gotchas
 
-1. **CO5300 cannot rotate.** Its MADCTL only supports axis flips, not column/row exchange. Rotation is done by **CPU pixel remapping in `my_flush_cb`** in main.cpp. We use **PARTIAL render mode with strip rotation** (small 480×40 strips, fast). On rotation change → AMOLED brightness flash → force redraw.
-2. **OPI PSRAM** required: `board_build.arduino.memory_type = qio_opi` in platformio.ini. Without this, `MALLOC_CAP_SPIRAM` returns NULL and the screen is black.
-3. **pioarduino platform required.** GFX Library for Arduino needs Arduino Core 3.x (`esp32-hal-periman.h`), not the 2.x that standard `espressif32` ships. We pin `pioarduino/platform-espressif32` 55.03.38-1.
-4. **LVGL 9 font patching.** `lv_font_conv` outputs LVGL 8 format. Must remove `#if LVGL_VERSION_MAJOR >= 8` guards, drop `.cache` field, add `.release_glyph`, `.kerning`, `.static_bitmap`, `.fallback`, `.user_data`. Without patching, fonts render invisible.
-5. **Touch reading must be centralized.** CST9220's `getPoint()` does a full I2C transaction. Calling it from multiple places consumed each other's data and broke input. `touch_read()` is called once per loop in main.cpp; both LVGL `my_touch_cb` and `touch.cpp` read from shared `touch_pressed/touch_x/touch_y` state.
-6. **CO5300 needs even-aligned flush regions.** `rounder_cb` enforces this.
-7. **Touch `setSwapXY(true)` and `setMirrorXY(true, false)`** are the empirically-correct values for default rotation 0. IMU rotation logic doesn't change touch mapping (it does CPU-side rotation of the rendered pixels, so LVGL still thinks the display is portrait at 0°).
-8. **LVGL RGB565A8 is planar.** `w*h` RGB565 pixels followed by `w*h` alpha bytes; `data_size = w*h*3`, `stride = w*2`. Use `init_icon_dsc_rgb565a8()` for icons that overlap non-uniform backgrounds (e.g. battery over splash). Lucide source PNGs are black-on-transparent — converter must tint to white or icons render invisible. See `tools/png_to_lvgl.js`.
+1. **pioarduino platform required.** GFX Library for Arduino 1.6.x needs Arduino Core 3.x (`esp32-hal-periman.h`), which standard `espressif32` 7.x does NOT provide. We use `pioarduino/platform-espressif32` (stable zip URL in platformio.ini). Standard `espressif32` gives Core 2.x → compile failure.
+2. **No PSRAM.** ESP32-WROOM-32 has no SPIRAM. All `heap_caps_malloc(…MALLOC_CAP_SPIRAM)` must be plain `malloc()`. LVGL partial render buffers are 135×40×2 = 10,800 bytes each — fits comfortably in SRAM.
+3. **ST7789 col/row offsets.** The 1.14" 135×240 panel needs `col_offset=52, row_offset=40` in `Arduino_ST7789` constructor or the image is shifted off-screen.
+4. **GPIO 18 = LCD SCLK.** Cannot be used for any other purpose (was BTN_FWD on the old board). BTN_FWD/right-button is permanently disabled.
+5. **Flash tight at 90%.** The default partition scheme gives 1.31 MB app space. Current build uses ~90%. Do not add large new font files or feature libraries without checking size. `pio run` reports flash usage after every build.
+6. **NimBLE-Arduino 2.5.0 deprecation warning.** `svc->start()` in `ble.cpp:154` emits a `-Wdeprecated-declarations` warning. This is harmless — the call is a no-op that still compiles and links cleanly. Do not remove it without testing BLE.
+7. **LVGL 9 font patching.** `lv_font_conv` outputs LVGL 8 format. Must remove `#if LVGL_VERSION_MAJOR >= 8` guards, drop `.cache` field, add `.release_glyph`, `.kerning`, `.static_bitmap`, `.fallback`, `.user_data`. Without patching, fonts render invisible.
+8. **LVGL RGB565A8 is planar.** `w*h` RGB565 pixels followed by `w*h` alpha bytes; `data_size = w*h*3`, `stride = w*2`. Use `init_icon_dsc_rgb565a8()` for icons that overlap non-uniform backgrounds. Lucide source PNGs are black-on-transparent — converter must tint to white. See `tools/png_to_lvgl.js`.
 
 ## Icons
 
-`tools/png_to_lvgl.js <input.png> <symbol> [W_MACRO] [H_MACRO] [--tint=RRGGBB | --no-tint]` converts an alpha PNG to RGB565A8. Default tint is white (`0xFFFFFF`) — necessary for Lucide PNGs. Splice output into `firmware/src/icons.h` and use `init_icon_dsc_rgb565a8()` in ui.cpp. Currently only the 5 battery icons use this format; the rest are still raw RGB565 baked over the panel background, fine because they live inside opaque zones.
+`tools/png_to_lvgl.js <input.png> <symbol> [W_MACRO] [H_MACRO] [--tint=RRGGBB | --no-tint]` converts an alpha PNG to RGB565A8. Default tint is white (`0xFFFFFF`) — necessary for Lucide PNGs. Splice output into `firmware/src/icons.h` and use `init_icon_dsc_rgb565a8()` in ui.cpp.
 
 ## Splash animations
 
@@ -72,20 +74,14 @@ node tools/scrape_claudepix.js  # → tools/claudepix_data/*.json
 node tools/convert_to_c.js      # → firmware/src/splash_animations.h
 ```
 
-Each animation has a per-animation 10-color RGB565 palette. Cell values 0..9 index it. Default boot screen.
-
-## User profile / preferences
-
-See `~/.claude/projects/.../memory/` files for persistent context (user is an embedded-beginner senior dev, brand-conscious, prefers iterative UI refinement, dislikes me authoring my own art when third-party assets are intended). Always read those memory files at session start.
+Each animation has a per-animation 10-color RGB565 palette. Cell values 0..9 index it. Rendered at 6× scale (120×120) centred on a 135×240 screen. Default boot screen.
 
 ## Recent session highlights
 
-- Migrated from Panlee SC01 Plus (480×320 IPS) to Waveshare 2.16" AMOLED (480×480 square). Full hardware/library swap.
-- Added IMU auto-rotation, battery indicator, USB-state-aware screen switching.
-- Added splash screen with scraped pixel-art animations and 3-button physical input layout.
-- Fonts and icons re-scaled ~1.9× for the higher-DPI panel.
-- All UI margins widened to 20px to clear the rounded display corners.
-- Battery icons converted to RGB565A8 alpha so they blend cleanly over the splash animations.
+- Originally targeted Waveshare ESP32-S3-Touch-AMOLED-2.16 (480×480, CO5300, PSRAM, IMU, touch, PMU). See git history for that version.
+- **Ported to ideaspark ESP32 1.14" ST7789** (135×240, no PSRAM, no IMU, no touch, no PMU). Full hardware swap: SPI display driver, stub power/IMU, complete UI layout redesign for 135×240, LVGL buffers in SRAM.
+- pioarduino platform retained (needed by GFX Library 1.6.x for `esp32-hal-periman.h`); switched board from `esp32s3box` → `esp32dev`.
+- Flash usage is tight (~90%); do not add large assets without checking.
 
 ## Daemon / host side
 
