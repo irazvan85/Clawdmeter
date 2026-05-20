@@ -211,6 +211,7 @@ void loop() {
                 copilot.premium_remaining = doc["pr"]  | -1;
                 copilot.premium_total     = doc["pe"]  | -1;
                 copilot.premium_reset_mins = doc["prm"] | -1;
+                strlcpy(copilot.premium_reset_str, doc["prd"] | "---", sizeof(copilot.premium_reset_str));
                 strlcpy(copilot.plan, doc["plan"] | "unknown", sizeof(copilot.plan));
                 copilot.enabled = doc["en"]  | false;
                 copilot.valid   = true;

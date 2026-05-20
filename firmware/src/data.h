@@ -16,7 +16,8 @@ struct CopilotData {
     int premium_remaining;    // requests remaining this month, -1 if unavailable
     int premium_total;        // monthly entitlement, -1 if unavailable
     int premium_reset_mins;   // minutes until monthly quota reset, -1 if unknown
-    char plan[20];            // "individual", "business", "enterprise", "unknown"
+    char premium_reset_str[24]; // formatted reset date from daemon, e.g. "Jun 1"
+    char plan[20];            // e.g. "Pro", "Business", "Enterprise", "unknown"
     bool enabled;             // Copilot seat is active
     bool valid;               // false until first successful parse
 };

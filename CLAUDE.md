@@ -19,8 +19,8 @@ This file is for future Claude Code sessions to bootstrap quickly. Read this fir
 ```text
 main.cpp        — setup(), loop(), BTN_BACK (GPIO0) polling, serial commands (screenshot, etc.)
 display_cfg.h   — pin defines (ST7789 SPI), LCD_WIDTH=135, LCD_HEIGHT=240, extern bus/gfx objects
-ui.{h,cpp}      — 3-screen UI (splash, usage, bluetooth); redesigned for 135×240
-splash.{h,cpp}  — 20×20 pixel-art animation engine, 6× upscale to 120×120 canvas
+ui.{h,cpp}      — 4-screen UI (splash, usage, copilot, bluetooth); redesigned for 135×240
+splash.{h,cpp}  — 20×20 pixel-art animation engine; 6× upscale (120×120) on splash, 4× (80×80) on Copilot screen
 imu.{h,cpp}     — stub: imu_get_rotation() always returns 0
 power.{h,cpp}   — stub: battery=-1, charging=false, pwr_pressed=false
 ble.{h,cpp}     — NimBLE peripheral: custom data service + HID keyboard (unchanged)
@@ -66,15 +66,14 @@ The boot screen is `SCREEN_SPLASH` and only advances on a physical button press.
 
 ## Splash animations
 
-13 × 20×20 pixel-art creature animations sourced from
-[claudepix.vercel.app](https://claudepix.vercel.app). Pipeline:
+15 × 20×20 pixel-art animations. 13 sourced from [claudepix.vercel.app](https://claudepix.vercel.app) (splash screen). 2 are manually authored Copilot mascot animations (`copilot_idle.json`, `copilot_thinking.json`). Pipeline:
 
 ```bash
-node tools/scrape_claudepix.js  # → tools/claudepix_data/*.json
-node tools/convert_to_c.js      # → firmware/src/splash_animations.h
+node tools/scrape_claudepix.js  # → tools/claudepix_data/*.json (claudepix only)
+node tools/convert_to_c.js      # → firmware/src/splash_animations.h (all 15)
 ```
 
-Each animation has a per-animation 10-color RGB565 palette. Cell values 0..9 index it. Rendered at 6× scale (120×120) centred on a 135×240 screen. Default boot screen.
+Each animation has a per-animation palette (up to 10 colors). Cell values index it. Splash screen renders at 6× scale (120×120). Copilot screen renders at 4× scale (80×80) and cycles between `copilot_idle` (10s) and `copilot_thinking` (5s). Do not hand-edit `splash_animations.h` — regenerate with `convert_to_c.js`.
 
 ## Recent session highlights
 
@@ -82,6 +81,11 @@ Each animation has a per-animation 10-color RGB565 palette. Cell values 0..9 ind
 - **Ported to ideaspark ESP32 1.14" ST7789** (135×240, no PSRAM, no IMU, no touch, no PMU). Full hardware swap: SPI display driver, stub power/IMU, complete UI layout redesign for 135×240, LVGL buffers in SRAM.
 - pioarduino platform retained (needed by GFX Library 1.6.x for `esp32-hal-periman.h`); switched board from `esp32s3box` → `esp32dev`.
 - Flash usage is tight (~90%); do not add large assets without checking.
+- **Added Copilot screen** (`SCREEN_COPILOT`) — VS Code-style premium-request usage panel: big colored `%` label (`lbl_copilot_pct`, `font_styrene_24`, colored by `pct_color()`), fraction right-aligned, progress bar (green/amber/red), reset date. Panel height 90px.
+- **Copilot animations**: `COPILOT_CELL=4` → 80×80 canvas. Cycles idle↔thinking: `COPILOT_IDLE_HOLD_MS=10000`, `COPILOT_THINK_HOLD_MS=5000`. Both animation indices looked up by name in `splash_copilot_init()`.
+- **`copilot_thinking.json`** manually authored: 4 frames, squinting eyes + light-blue thought dots (upper-right). Not from claudepix scraper — keep in `tools/claudepix_data/` alongside `copilot_idle.json`.
+- **`data.h` `CopilotData`**: fields `premium_pct`, `premium_remaining`, `premium_total`, `premium_reset_mins`, `premium_reset_str[24]`, `plan[20]`, `enabled`, `valid`.
+- **`daemon/claude_usage_daemon.py`**: plan name mapping (`individual`→`Pro` etc.), `prd` formatted reset date field.
 
 ## Daemon / host side
 

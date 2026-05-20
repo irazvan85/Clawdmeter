@@ -54,7 +54,8 @@ static lv_obj_t* lbl_ble_mac;
 
 // ---- Copilot screen widgets ----
 static lv_obj_t* copilot_container;
-static lv_obj_t* lbl_copilot_accept_pct;
+static lv_obj_t* lbl_copilot_pct;          // big "73%" number
+static lv_obj_t* lbl_copilot_accept_pct;   // small "219 / 300 used" fraction
 static lv_obj_t* bar_copilot;
 static lv_obj_t* lbl_copilot_detail;
 static lv_obj_t* lbl_copilot_suggest;
@@ -327,26 +328,54 @@ static void init_copilot_screen(lv_obj_t* scr) {
     lv_obj_clear_flag(copilot_container, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_event_cb(copilot_container, global_click_cb, LV_EVENT_CLICKED, NULL);
 
+    // Title "Copilot" left-aligned; plan pill ("Pro") floated to the right
     lv_obj_t* lbl_cp_title = lv_label_create(copilot_container);
     lv_label_set_text(lbl_cp_title, "Copilot");
     lv_obj_set_style_text_font(lbl_cp_title, &font_tiempos_34, 0);
     lv_obj_set_style_text_color(lbl_cp_title, COL_TEXT, 0);
-    lv_obj_align(lbl_cp_title, LV_ALIGN_TOP_MID, 0, TITLE_Y);
+    lv_obj_set_pos(lbl_cp_title, MARGIN, TITLE_Y);
 
-    // Panel 1 — premium request usage %
-    {
-        lv_obj_t* _pill;
-        make_copilot_panel(copilot_container, CONTENT_Y, "Premium",
-                           &lbl_copilot_accept_pct, &_pill, &bar_copilot, &lbl_copilot_detail);
-    }
+    lbl_copilot_suggest = make_pill(copilot_container, "---");
+    lv_obj_align(lbl_copilot_suggest, LV_ALIGN_TOP_RIGHT, -MARGIN, TITLE_Y + 8);
 
-    // Panel 2 — remaining count + reset info
-    {
-        lv_obj_t *_pill, *_bar;
-        make_copilot_panel(copilot_container, CONTENT_Y + COPILOT_PANEL_H + COPILOT_PANEL_GAP, "Quota",
-                           &lbl_copilot_suggest, &_pill, &_bar, &lbl_copilot_status);
-        lv_label_set_text(lbl_copilot_suggest, "---");
-    }
+    // Single panel — mirrors VS Code Copilot usage panel
+    lv_obj_t* panel = make_panel(copilot_container, MARGIN, CONTENT_Y, CONTENT_W, 100);
+
+    // "Premium requests" header (static, dim)
+    lv_obj_t* lbl_hdr = lv_label_create(panel);
+    lv_label_set_text(lbl_hdr, "Premium requests");
+    lv_obj_set_style_text_font(lbl_hdr, &font_styrene_12, 0);
+    lv_obj_set_style_text_color(lbl_hdr, COL_DIM, 0);
+    lv_obj_set_pos(lbl_hdr, 0, 0);
+
+    // Big "73%" usage percentage — prominent, left side
+    lbl_copilot_pct = lv_label_create(panel);
+    lv_label_set_text(lbl_copilot_pct, "---%");
+    lv_obj_set_style_text_font(lbl_copilot_pct, &font_styrene_24, 0);
+    lv_obj_set_style_text_color(lbl_copilot_pct, COL_TEXT, 0);
+    lv_obj_set_pos(lbl_copilot_pct, 0, 14);
+
+    // Small "219 / 300 used" fraction — right-aligned, below the big %
+    lbl_copilot_accept_pct = lv_label_create(panel);
+    lv_label_set_text(lbl_copilot_accept_pct, "--- / --- used");
+    lv_obj_set_style_text_font(lbl_copilot_accept_pct, &font_styrene_12, 0);
+    lv_obj_set_style_text_color(lbl_copilot_accept_pct, COL_DIM, 0);
+    lv_obj_align(lbl_copilot_accept_pct, LV_ALIGN_TOP_RIGHT, 0, 42);
+
+    // Progress bar
+    bar_copilot = make_bar(panel, 0, 56, CONTENT_W - 16, 12);
+
+    // "Resets Jun 1" reset date
+    lbl_copilot_detail = lv_label_create(panel);
+    lv_label_set_text(lbl_copilot_detail, "---");
+    lv_obj_set_style_text_font(lbl_copilot_detail, &font_styrene_12, 0);
+    lv_obj_set_style_text_color(lbl_copilot_detail, COL_DIM, 0);
+    lv_obj_set_pos(lbl_copilot_detail, 0, 70);
+
+    // lbl_copilot_status kept hidden (backward compat, not shown in new layout)
+    lbl_copilot_status = lv_label_create(panel);
+    lv_label_set_text(lbl_copilot_status, "");
+    lv_obj_add_flag(lbl_copilot_status, LV_OBJ_FLAG_HIDDEN);
 
     // Pixel-art Copilot mascot animation (60x60, aligned bottom-centre)
     splash_copilot_init(copilot_container);
@@ -502,38 +531,39 @@ void ui_update(const UsageData* data) {
 void ui_update_copilot(const CopilotData* data) {
     if (!data->valid) return;
 
-    // Panel 1 — premium request usage %
-    if (data->premium_pct >= 0) {
-        lv_label_set_text_fmt(lbl_copilot_accept_pct, "%d%%", data->premium_pct);
+    // Plan pill in title area
+    lv_label_set_text(lbl_copilot_suggest, data->plan[0] ? data->plan : "---");
+
+    // Big percentage + fraction quota line + bar
+    if (data->premium_remaining >= 0 && data->premium_total > 0) {
+        int used = data->premium_total - data->premium_remaining;
+        int pct = data->premium_pct >= 0 ? data->premium_pct : 0;
+        lv_label_set_text_fmt(lbl_copilot_pct, "%d%%", pct);
+        lv_obj_set_style_text_color(lbl_copilot_pct, pct_color((float)pct), 0);
+        lv_label_set_text_fmt(lbl_copilot_accept_pct, "%d / %d used", used, data->premium_total);
+        lv_bar_set_value(bar_copilot, pct, LV_ANIM_ON);
+        lv_obj_set_style_bg_color(bar_copilot, pct_color((float)pct), LV_PART_INDICATOR);
+    } else if (data->premium_pct >= 0) {
+        lv_label_set_text_fmt(lbl_copilot_pct, "%d%%", data->premium_pct);
+        lv_obj_set_style_text_color(lbl_copilot_pct, pct_color((float)data->premium_pct), 0);
+        lv_label_set_text(lbl_copilot_accept_pct, "--- / --- used");
         lv_bar_set_value(bar_copilot, data->premium_pct, LV_ANIM_ON);
         lv_obj_set_style_bg_color(bar_copilot, pct_color((float)data->premium_pct), LV_PART_INDICATOR);
     } else {
-        lv_label_set_text(lbl_copilot_accept_pct, "---%");
+        lv_label_set_text(lbl_copilot_pct, "---%");
+        lv_obj_set_style_text_color(lbl_copilot_pct, COL_DIM, 0);
+        lv_label_set_text(lbl_copilot_accept_pct, "--- / --- used");
         lv_bar_set_value(bar_copilot, 0, LV_ANIM_OFF);
     }
 
-    char buf[48];
-    if (data->premium_remaining >= 0 && data->premium_total > 0) {
-        snprintf(buf, sizeof(buf), "%d of %d remaining", data->premium_remaining, data->premium_total);
+    // Reset date: prefer daemon-formatted string, fall back to relative countdown
+    char buf[40];
+    if (data->premium_reset_str[0] && strcmp(data->premium_reset_str, "---") != 0) {
+        snprintf(buf, sizeof(buf), "Resets %s", data->premium_reset_str);
     } else {
-        snprintf(buf, sizeof(buf), "No quota data");
+        format_reset_time(data->premium_reset_mins, buf, sizeof(buf));
     }
     lv_label_set_text(lbl_copilot_detail, buf);
-
-    // Panel 2 — remaining count + reset countdown
-    if (data->premium_remaining >= 0) {
-        lv_label_set_text_fmt(lbl_copilot_suggest, "%d", data->premium_remaining);
-    } else {
-        lv_label_set_text(lbl_copilot_suggest, "---");
-    }
-    char reset_buf[12] = "---";
-    if (data->premium_reset_mins > 0) {
-        int days = data->premium_reset_mins / 1440;
-        if (days > 0) snprintf(reset_buf, sizeof(reset_buf), "%dd", days);
-        else          snprintf(reset_buf, sizeof(reset_buf), "%dh", data->premium_reset_mins / 60);
-    }
-    snprintf(buf, sizeof(buf), "%.12s \xC2\xB7 Resets %s", data->plan, reset_buf);
-    lv_label_set_text(lbl_copilot_status, buf);
 }
 
 void ui_tick_anim(void) {

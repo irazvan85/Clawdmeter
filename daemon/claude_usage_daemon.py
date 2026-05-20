@@ -101,7 +101,12 @@ async def poll_copilot(gh_token: str) -> dict | None:
             if resp.status_code == 200:
                 data = resp.json()
                 result["en"] = True
-                result["plan"] = data.get("copilot_plan", "individual")
+                plan_raw = data.get("copilot_plan", "individual").lower()
+                _plan_map = {
+                    "individual": "Pro", "pro": "Pro", "copilot_pro": "Pro",
+                    "business": "Business", "enterprise": "Enterprise",
+                }
+                result["plan"] = _plan_map.get(plan_raw, plan_raw.title())
 
                 # premium_interactions quota
                 pi = (data.get("quota_snapshots") or {}).get("premium_interactions") or {}
@@ -125,6 +130,8 @@ async def poll_copilot(gh_token: str) -> dict | None:
                             reset_dt = datetime.fromisoformat(reset_date + "T00:00:00+00:00")
                         mins = int((reset_dt - datetime.now(timezone.utc)).total_seconds() / 60)
                         result["prm"] = max(0, mins)
+                        local_dt = reset_dt.astimezone()
+                        result["prd"] = local_dt.strftime("%b ") + str(local_dt.day)
                     except Exception:
                         pass
             elif resp.status_code == 404:
