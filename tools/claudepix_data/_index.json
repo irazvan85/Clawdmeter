@@ -96,12 +96,5 @@
     "category": "Copilot",
     "frame_count": 4,
     "palette_size": 5
-  },
-  {
-    "filename": "copilot_thinking.json",
-    "name": "copilot thinking",
-    "category": "Copilot",
-    "frame_count": 4,
-    "palette_size": 6
   }
 ]

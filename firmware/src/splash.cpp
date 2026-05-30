@@ -91,23 +91,16 @@ static void render_frame(const uint8_t *cells, const uint16_t *palette) {
     render_frame_to(canvas_buf, canvas, CANVAS_W, CELL, cells, palette);
 }
 
-// ---- Copilot canvas (80x80 @ 4x scale) ----
-#define COPILOT_CELL     4
-#define COPILOT_CANVAS_W (GRID * COPILOT_CELL)   // 80
-#define COPILOT_CANVAS_H (GRID * COPILOT_CELL)   // 80
+// ---- Copilot canvas (60x60 @ 3x scale) ----
+#define COPILOT_CELL     3
+#define COPILOT_CANVAS_W (GRID * COPILOT_CELL)   // 60
+#define COPILOT_CANVAS_H (GRID * COPILOT_CELL)   // 60
 
-// Switch between "copilot idle" and "copilot thinking" every N ms
-#define COPILOT_IDLE_HOLD_MS   10000
-#define COPILOT_THINK_HOLD_MS   5000
-
-static lv_obj_t*  copilot_canvas        = NULL;
-static uint16_t*  copilot_canvas_buf    = NULL;
-static int16_t    copilot_anim_idx      = -1;  // "copilot idle" index
-static int16_t    copilot_think_idx     = -1;  // "copilot thinking" index
-static int16_t    copilot_cur_anim      = -1;  // currently playing
-static uint16_t   copilot_frame_idx     = 0;
-static uint32_t   copilot_frame_ms      = 0;
-static uint32_t   copilot_anim_start_ms = 0;
+static lv_obj_t*  copilot_canvas     = NULL;
+static uint16_t*  copilot_canvas_buf = NULL;
+static int16_t    copilot_anim_idx   = -1;  // index into splash_anims[]
+static uint16_t   copilot_frame_idx  = 0;
+static uint32_t   copilot_frame_ms   = 0;
 
 void splash_copilot_init(lv_obj_t* parent) {
     copilot_canvas_buf = (uint16_t*)malloc(COPILOT_CANVAS_W * COPILOT_CANVAS_H * 2);
@@ -122,53 +115,32 @@ void splash_copilot_init(lv_obj_t* parent) {
                          COPILOT_CANVAS_W, COPILOT_CANVAS_H, LV_COLOR_FORMAT_RGB565);
     lv_obj_align(copilot_canvas, LV_ALIGN_BOTTOM_MID, 0, -4);
 
-    // Find animations by name
-    copilot_anim_idx  = -1;
-    copilot_think_idx = -1;
+    // Find "copilot idle" animation by name
+    copilot_anim_idx = -1;
     for (int i = 0; i < SPLASH_ANIM_COUNT; i++) {
-        if (strcmp(splash_anims[i].name, "copilot idle")     == 0) copilot_anim_idx  = (int16_t)i;
-        if (strcmp(splash_anims[i].name, "copilot thinking") == 0) copilot_think_idx = (int16_t)i;
+        if (strcmp(splash_anims[i].name, "copilot idle") == 0) {
+            copilot_anim_idx = (int16_t)i;
+            break;
+        }
     }
     if (copilot_anim_idx < 0) {
         Serial.println("splash: 'copilot idle' animation not found");
         return;
     }
-    copilot_cur_anim    = copilot_anim_idx;
-    const splash_anim_def_t* a = &splash_anims[copilot_cur_anim];
+    const splash_anim_def_t* a = &splash_anims[copilot_anim_idx];
     render_frame_to(copilot_canvas_buf, copilot_canvas,
                     COPILOT_CANVAS_W, COPILOT_CELL, a->frames[0], a->palette);
-    copilot_frame_idx     = 0;
-    copilot_frame_ms      = millis();
-    copilot_anim_start_ms = millis();
+    copilot_frame_idx = 0;
+    copilot_frame_ms  = millis();
 }
 
 void splash_copilot_tick(void) {
-    if (copilot_cur_anim < 0 || !copilot_canvas_buf) return;
-
-    // Switch between idle and thinking animations
-    uint32_t now = millis();
-    bool is_idle   = (copilot_cur_anim == copilot_anim_idx);
-    uint32_t hold  = is_idle ? COPILOT_IDLE_HOLD_MS : COPILOT_THINK_HOLD_MS;
-    if (now - copilot_anim_start_ms >= hold) {
-        int16_t next = (is_idle && copilot_think_idx >= 0) ? copilot_think_idx : copilot_anim_idx;
-        if (next != copilot_cur_anim) {
-            copilot_cur_anim      = next;
-            copilot_frame_idx     = 0;
-            copilot_frame_ms      = now;
-            copilot_anim_start_ms = now;
-            const splash_anim_def_t* na = &splash_anims[copilot_cur_anim];
-            render_frame_to(copilot_canvas_buf, copilot_canvas,
-                            COPILOT_CANVAS_W, COPILOT_CELL, na->frames[0], na->palette);
-            return;
-        }
-        copilot_anim_start_ms = now;  // reset timer if same anim
-    }
-
-    const splash_anim_def_t* a = &splash_anims[copilot_cur_anim];
+    if (copilot_anim_idx < 0 || !copilot_canvas_buf) return;
+    const splash_anim_def_t* a = &splash_anims[copilot_anim_idx];
     if (a->frame_count == 0) return;
-    if (now - copilot_frame_ms >= a->holds[copilot_frame_idx]) {
+    if (millis() - copilot_frame_ms >= a->holds[copilot_frame_idx]) {
         copilot_frame_idx = (copilot_frame_idx + 1) % a->frame_count;
-        copilot_frame_ms  = now;
+        copilot_frame_ms  = millis();
         render_frame_to(copilot_canvas_buf, copilot_canvas,
                         COPILOT_CANVAS_W, COPILOT_CELL,
                         a->frames[copilot_frame_idx], a->palette);
