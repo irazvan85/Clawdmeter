@@ -27,6 +27,7 @@ Arduino_ST7789  *gfx = new Arduino_ST7789(
 
 static UsageData usage = {};
 static CopilotData copilot = {};
+static SysInfoData sysinfo = {};
 
 // ---- LVGL draw buffers (partial render) ----
 #define BUF_LINES 40
@@ -216,6 +217,18 @@ void loop() {
                 copilot.enabled = doc["en"]  | false;
                 copilot.valid   = true;
                 ui_update_copilot(&copilot);
+                ble_send_ack();
+            } else if (strcmp(src, "sysinfo") == 0) {
+                sysinfo.cpu_pct      = doc["cpu"]  | -1;
+                sysinfo.cpu_temp     = doc["ct"]   | -1.0f;
+                sysinfo.ram_pct      = doc["rp"]   | -1;
+                sysinfo.ram_used_gb  = doc["ru"]   | 0.0f;
+                sysinfo.ram_total_gb = doc["rt"]   | 0.0f;
+                sysinfo.disk_pct     = doc["dp"]   | -1;
+                sysinfo.disk_used_gb = doc["du"]   | 0.0f;
+                sysinfo.disk_total_gb = doc["dt"]  | 0.0f;
+                sysinfo.valid = true;
+                ui_update_sysinfo(&sysinfo);
                 ble_send_ack();
             } else {
                 usage.session_pct        = doc["s"]  | 0.0f;

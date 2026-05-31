@@ -29,6 +29,7 @@ REQ_CHAR_UUID = "4c41555a-4465-7669-6365-000000000004"
 
 POLL_INTERVAL = 60
 COPILOT_POLL_INTERVAL = 300  # 5 minutes
+SYSINFO_POLL_INTERVAL = 30   # 30 seconds
 TICK = 5
 SCAN_TIMEOUT = 8.0
 
@@ -143,6 +144,66 @@ async def poll_copilot(gh_token: str) -> dict | None:
         f"Copilot: plan={result['plan']} enabled={result['en']} "
         f"premium={result['pp']}% remaining={result['pr']}/{result['pe']} reset_mins={result['prm']}"
     )
+    return result
+
+
+def poll_sysinfo() -> dict:
+    """Collect CPU, RAM, and disk stats via psutil.
+
+    Returns a dict ready to send as a BLE JSON payload with src='sysinfo'.
+    All fields fall back to -1 / 0.0 when unavailable (e.g. no sensor data on macOS).
+    """
+    result: dict = {
+        "src": "sysinfo",
+        "cpu": -1,   # CPU utilization 0-100
+        "ct": -1.0,  # CPU temperature °C
+        "rp": -1,    # RAM used %
+        "ru": 0.0,   # RAM used GB
+        "rt": 0.0,   # RAM total GB
+        "dp": -1,    # Disk used %
+        "du": 0.0,   # Disk used GB
+        "dt": 0.0,   # Disk total GB
+    }
+    try:
+        import psutil  # type: ignore[import-untyped]
+
+        result["cpu"] = int(psutil.cpu_percent(interval=None))
+
+        try:
+            temps = psutil.sensors_temperatures()
+            if temps:
+                # Prefer coretemp / k10temp / cpu_thermal; fall back to first entry
+                for key in ("coretemp", "k10temp", "cpu_thermal", "acpitz"):
+                    if key in temps and temps[key]:
+                        result["ct"] = round(temps[key][0].current, 1)
+                        break
+                else:
+                    first_group = next(iter(temps.values()))
+                    if first_group:
+                        result["ct"] = round(first_group[0].current, 1)
+        except (AttributeError, OSError):
+            pass  # macOS: sensors_temperatures() not available
+
+        vm = psutil.virtual_memory()
+        result["rp"] = int(vm.percent)
+        result["ru"] = round(vm.used / 1e9, 1)
+        result["rt"] = round(vm.total / 1e9, 1)
+
+        du = psutil.disk_usage("/")
+        result["dp"] = int(du.percent)
+        result["du"] = round(du.used / 1e9, 0)
+        result["dt"] = round(du.total / 1e9, 0)
+
+        log(
+            f"Sysinfo: cpu={result['cpu']}% temp={result['ct']}°C "
+            f"ram={result['rp']}% ({result['ru']}/{result['rt']} GB) "
+            f"disk={result['dp']}% ({result['du']}/{result['dt']} GB)"
+        )
+    except ImportError:
+        log("psutil not installed; skipping sysinfo poll (pip install psutil)")
+    except Exception as exc:
+        log(f"Sysinfo poll error: {exc}")
+
     return result
 
 
@@ -343,7 +404,16 @@ async def connect_and_run(address: str, stop_event: asyncio.Event) -> bool:
 
     last_poll = 0.0
     last_copilot_poll = 0.0
+    last_sysinfo_poll = 0.0
     used_successfully = False
+
+    # Warm up cpu_percent so the first non-blocking call returns a real value
+    try:
+        import psutil  # type: ignore[import-untyped]
+        psutil.cpu_percent(interval=None)
+    except ImportError:
+        pass
+
     try:
         while client.is_connected and not stop_event.is_set():
             now = time.time()
@@ -376,6 +446,13 @@ async def connect_and_run(address: str, stop_event: asyncio.Event) -> bool:
                         await session.write_payload(cp_payload)
                 else:
                     log("No GitHub token (install gh CLI and run 'gh auth login'); skipping Copilot poll")
+
+            # System info poll every 30 seconds
+            now = time.time()
+            if now - last_sysinfo_poll >= SYSINFO_POLL_INTERVAL:
+                last_sysinfo_poll = now
+                si_payload = poll_sysinfo()
+                await session.write_payload(si_payload)
     finally:
         try:
             await client.disconnect()
