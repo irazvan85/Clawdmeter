@@ -30,6 +30,6 @@ struct SysInfoData {
     float ram_total_gb; // RAM total (GB)
     int disk_pct;       // 0-100, disk used %; -1 if unavailable
     float disk_used_gb; // disk used (GB)
-    float disk_total_gb;// disk total (GB)
+    float disk_total_gb; // disk total (GB)
     bool valid;         // false until first successful parse
 };
