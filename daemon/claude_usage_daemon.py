@@ -189,7 +189,8 @@ def poll_sysinfo() -> dict:
         result["ru"] = round(vm.used / 1e9, 1)
         result["rt"] = round(vm.total / 1e9, 1)
 
-        du = psutil.disk_usage("/")
+        disk_path = (os.getenv('SystemDrive', 'C:') + os.sep) if sys.platform.startswith('win') else '/'
+        du = psutil.disk_usage(disk_path)
         result["dp"] = int(du.percent)
         result["du"] = round(du.used / 1e9, 0)
         result["dt"] = round(du.total / 1e9, 0)
