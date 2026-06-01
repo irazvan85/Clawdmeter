@@ -60,6 +60,18 @@ static lv_obj_t* lbl_copilot_detail;
 static lv_obj_t* lbl_copilot_suggest;
 static lv_obj_t* lbl_copilot_status;
 
+// ---- Sysinfo screen widgets ----
+static lv_obj_t* sysinfo_container;
+static lv_obj_t* lbl_cpu_pct;
+static lv_obj_t* bar_cpu;
+static lv_obj_t* lbl_cpu_detail;
+static lv_obj_t* lbl_ram_pct;
+static lv_obj_t* bar_ram;
+static lv_obj_t* lbl_ram_detail;
+static lv_obj_t* lbl_disk_pct;
+static lv_obj_t* bar_disk;
+static lv_obj_t* lbl_disk_detail;
+
 // ---- Battery indicator (shared, on top) ----
 static lv_obj_t* battery_img;
 static lv_obj_t* logo_img;
@@ -354,6 +366,56 @@ static void init_copilot_screen(lv_obj_t* scr) {
     lv_obj_add_flag(copilot_container, LV_OBJ_FLAG_HIDDEN);
 }
 
+// ======== Sysinfo Screen (135x240) ========
+// Three 60px panels: CPU, RAM, Disk. Reuses COPILOT_PANEL_H/GAP constants.
+
+static void init_sysinfo_screen(lv_obj_t* scr) {
+    sysinfo_container = lv_obj_create(scr);
+    lv_obj_set_size(sysinfo_container, SCR_W, SCR_H);
+    lv_obj_set_pos(sysinfo_container, 0, 0);
+    lv_obj_set_style_bg_opa(sysinfo_container, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(sysinfo_container, 0, 0);
+    lv_obj_set_style_pad_all(sysinfo_container, 0, 0);
+    lv_obj_clear_flag(sysinfo_container, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(sysinfo_container, global_click_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t* lbl_si_title = lv_label_create(sysinfo_container);
+    lv_label_set_text(lbl_si_title, "System");
+    lv_obj_set_style_text_font(lbl_si_title, &font_tiempos_34, 0);
+    lv_obj_set_style_text_color(lbl_si_title, COL_TEXT, 0);
+    lv_obj_align(lbl_si_title, LV_ALIGN_TOP_MID, 0, TITLE_Y);
+
+    int y = CONTENT_Y;
+
+    // Panel 1 — CPU
+    {
+        lv_obj_t *_pill;
+        make_copilot_panel(sysinfo_container, y, "CPU",
+                           &lbl_cpu_pct, &_pill, &bar_cpu, &lbl_cpu_detail);
+        lv_label_set_text(lbl_cpu_pct, "---%");
+    }
+    y += COPILOT_PANEL_H + COPILOT_PANEL_GAP;
+
+    // Panel 2 — RAM
+    {
+        lv_obj_t *_pill;
+        make_copilot_panel(sysinfo_container, y, "RAM",
+                           &lbl_ram_pct, &_pill, &bar_ram, &lbl_ram_detail);
+        lv_label_set_text(lbl_ram_pct, "---%");
+    }
+    y += COPILOT_PANEL_H + COPILOT_PANEL_GAP;
+
+    // Panel 3 — Disk
+    {
+        lv_obj_t *_pill;
+        make_copilot_panel(sysinfo_container, y, "Disk",
+                           &lbl_disk_pct, &_pill, &bar_disk, &lbl_disk_detail);
+        lv_label_set_text(lbl_disk_pct, "---%");
+    }
+
+    lv_obj_add_flag(sysinfo_container, LV_OBJ_FLAG_HIDDEN);
+}
+
 // ======== Bluetooth Screen (135x240) ========
 
 static void init_bluetooth_screen(lv_obj_t* scr) {
@@ -455,6 +517,7 @@ void ui_init(void) {
 
     init_usage_screen(scr);
     init_copilot_screen(scr);
+    init_sysinfo_screen(scr);
     init_bluetooth_screen(scr);
     splash_init(scr);
 
@@ -536,6 +599,56 @@ void ui_update_copilot(const CopilotData* data) {
     lv_label_set_text(lbl_copilot_status, buf);
 }
 
+void ui_update_sysinfo(const SysInfoData* data) {
+    if (!data->valid) return;
+
+    char buf[40];
+
+    // CPU panel
+    if (data->cpu_pct >= 0) {
+        lv_label_set_text_fmt(lbl_cpu_pct, "%d%%", data->cpu_pct);
+        lv_bar_set_value(bar_cpu, data->cpu_pct, LV_ANIM_ON);
+        lv_obj_set_style_bg_color(bar_cpu, pct_color((float)data->cpu_pct), LV_PART_INDICATOR);
+    } else {
+        lv_label_set_text(lbl_cpu_pct, "---%");
+        lv_bar_set_value(bar_cpu, 0, LV_ANIM_OFF);
+    }
+    if (data->cpu_temp >= 0.0f) {
+        snprintf(buf, sizeof(buf), "%.0f\xC2\xB0""C", (double)data->cpu_temp);
+    } else {
+        snprintf(buf, sizeof(buf), "---");
+    }
+    lv_label_set_text(lbl_cpu_detail, buf);
+
+    // RAM panel
+    if (data->ram_pct >= 0) {
+        lv_label_set_text_fmt(lbl_ram_pct, "%d%%", data->ram_pct);
+        lv_bar_set_value(bar_ram, data->ram_pct, LV_ANIM_ON);
+        lv_obj_set_style_bg_color(bar_ram, pct_color((float)data->ram_pct), LV_PART_INDICATOR);
+        snprintf(buf, sizeof(buf), "%.1f / %.1f GB",
+                 (double)data->ram_used_gb, (double)data->ram_total_gb);
+    } else {
+        lv_label_set_text(lbl_ram_pct, "---%");
+        lv_bar_set_value(bar_ram, 0, LV_ANIM_OFF);
+        snprintf(buf, sizeof(buf), "---");
+    }
+    lv_label_set_text(lbl_ram_detail, buf);
+
+    // Disk panel
+    if (data->disk_pct >= 0) {
+        lv_label_set_text_fmt(lbl_disk_pct, "%d%%", data->disk_pct);
+        lv_bar_set_value(bar_disk, data->disk_pct, LV_ANIM_ON);
+        lv_obj_set_style_bg_color(bar_disk, pct_color((float)data->disk_pct), LV_PART_INDICATOR);
+        snprintf(buf, sizeof(buf), "%.0f / %.0f GB",
+                 (double)data->disk_used_gb, (double)data->disk_total_gb);
+    } else {
+        lv_label_set_text(lbl_disk_pct, "---%");
+        lv_bar_set_value(bar_disk, 0, LV_ANIM_OFF);
+        snprintf(buf, sizeof(buf), "---");
+    }
+    lv_label_set_text(lbl_disk_detail, buf);
+}
+
 void ui_tick_anim(void) {
     // Copilot screen: advance pixel-art mascot animation
     if (current_screen == SCREEN_COPILOT) {
@@ -594,6 +707,7 @@ static void ble_reset_click_cb(lv_event_t* e) {
 void ui_show_screen(screen_t screen) {
     lv_obj_add_flag(usage_container, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(copilot_container, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(sysinfo_container, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(ble_container, LV_OBJ_FLAG_HIDDEN);
     splash_hide();
 
@@ -601,6 +715,7 @@ void ui_show_screen(screen_t screen) {
     case SCREEN_SPLASH:     splash_show(); break;
     case SCREEN_USAGE:      lv_obj_clear_flag(usage_container, LV_OBJ_FLAG_HIDDEN); break;
     case SCREEN_COPILOT:    lv_obj_clear_flag(copilot_container, LV_OBJ_FLAG_HIDDEN); break;
+    case SCREEN_SYSINFO:    lv_obj_clear_flag(sysinfo_container, LV_OBJ_FLAG_HIDDEN); break;
     case SCREEN_BLUETOOTH:  lv_obj_clear_flag(ble_container, LV_OBJ_FLAG_HIDDEN); break;
     default: break;
     }
@@ -615,9 +730,10 @@ void ui_show_screen(screen_t screen) {
 
 void ui_cycle_screen(void) {
     screen_t next;
-    if (current_screen == SCREEN_USAGE)    next = SCREEN_COPILOT;
-    else if (current_screen == SCREEN_COPILOT) next = SCREEN_BLUETOOTH;
-    else                                   next = SCREEN_USAGE;
+    if (current_screen == SCREEN_USAGE)         next = SCREEN_COPILOT;
+    else if (current_screen == SCREEN_COPILOT)  next = SCREEN_SYSINFO;
+    else if (current_screen == SCREEN_SYSINFO)  next = SCREEN_BLUETOOTH;
+    else                                        next = SCREEN_USAGE;
     ui_show_screen(next);
 }
 

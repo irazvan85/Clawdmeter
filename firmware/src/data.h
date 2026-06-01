@@ -21,3 +21,15 @@ struct CopilotData {
     bool enabled;             // Copilot seat is active
     bool valid;               // false until first successful parse
 };
+
+struct SysInfoData {
+    int cpu_pct;        // 0-100, CPU utilization; -1 if unavailable
+    float cpu_temp;     // °C; -1 if unavailable
+    int ram_pct;        // 0-100, RAM used %; -1 if unavailable
+    float ram_used_gb;  // RAM used (GB)
+    float ram_total_gb; // RAM total (GB)
+    int disk_pct;       // 0-100, disk used %; -1 if unavailable
+    float disk_used_gb; // disk used (GB)
+    float disk_total_gb; // disk total (GB)
+    bool valid;         // false until first successful parse
+};

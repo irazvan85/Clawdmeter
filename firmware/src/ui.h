@@ -6,6 +6,7 @@ enum screen_t {
     SCREEN_SPLASH,
     SCREEN_USAGE,
     SCREEN_COPILOT,
+    SCREEN_SYSINFO,
     SCREEN_BLUETOOTH,
     SCREEN_COUNT,
 };
@@ -13,6 +14,7 @@ enum screen_t {
 void ui_init(void);
 void ui_update(const UsageData* data);
 void ui_update_copilot(const CopilotData* data);
+void ui_update_sysinfo(const SysInfoData* data);
 void ui_tick_anim(void);
 void ui_show_screen(screen_t screen);
 void ui_cycle_screen(void);
