@@ -201,7 +201,9 @@ def poll_sysinfo() -> dict:
             f"disk={result['dp']}% ({result['du']}/{result['dt']} GB)"
         )
     except ImportError:
-        log("psutil not installed; skipping sysinfo poll (pip install psutil)")
+        if not getattr(poll_sysinfo, "_missing_logged", False):
+            log("psutil not installed; skipping sysinfo poll (pip install psutil)")
+            setattr(poll_sysinfo, "_missing_logged", True)
     except Exception as exc:
         log(f"Sysinfo poll error: {exc}")
 
