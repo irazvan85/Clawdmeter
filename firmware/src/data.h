@@ -33,3 +33,12 @@ struct SysInfoData {
     float disk_total_gb; // disk total (GB)
     bool valid;         // false until first successful parse
 };
+
+struct VscodeData {
+    int mem_mb;         // total VS Code process RSS in MB; -1 if unavailable
+    int cpu_pct;        // total VS Code CPU %; -1 if unavailable
+    int ext_count;      // number of extension host processes; -1 if unavailable
+    int error_count;    // error/critical log lines in last 30 min; -1 if unavailable
+    char last_error[32];// last error snippet (truncated); empty if none
+    bool valid;         // false until first successful parse
+};

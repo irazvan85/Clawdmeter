@@ -28,6 +28,7 @@ Arduino_ST7789  *gfx = new Arduino_ST7789(
 static UsageData usage = {};
 static CopilotData copilot = {};
 static SysInfoData sysinfo = {};
+static VscodeData vscode = {};
 
 // ---- LVGL draw buffers (partial render) ----
 #define BUF_LINES 40
@@ -229,6 +230,15 @@ void loop() {
                 sysinfo.disk_total_gb = doc["dt"]  | 0.0f;
                 sysinfo.valid = true;
                 ui_update_sysinfo(&sysinfo);
+                ble_send_ack();
+            } else if (strcmp(src, "vscode") == 0) {
+                vscode.mem_mb      = doc["mm"]  | -1;
+                vscode.cpu_pct     = doc["vc"]  | -1;
+                vscode.ext_count   = doc["xe"]  | -1;
+                vscode.error_count = doc["ec"]  | -1;
+                strlcpy(vscode.last_error, doc["le"] | "", sizeof(vscode.last_error));
+                vscode.valid = true;
+                ui_update_vscode(&vscode);
                 ble_send_ack();
             } else {
                 usage.session_pct        = doc["s"]  | 0.0f;

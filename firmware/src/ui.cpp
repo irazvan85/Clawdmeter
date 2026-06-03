@@ -72,6 +72,18 @@ static lv_obj_t* lbl_disk_pct;
 static lv_obj_t* bar_disk;
 static lv_obj_t* lbl_disk_detail;
 
+// ---- VS Code screen widgets ----
+static lv_obj_t* vscode_container;
+static lv_obj_t* lbl_vscode_mem;
+static lv_obj_t* bar_vscode_mem;
+static lv_obj_t* lbl_vscode_mem_detail;
+static lv_obj_t* lbl_vscode_ext;
+static lv_obj_t* bar_vscode_ext;
+static lv_obj_t* lbl_vscode_ext_detail;
+static lv_obj_t* lbl_vscode_err;
+static lv_obj_t* bar_vscode_err;
+static lv_obj_t* lbl_vscode_err_detail;
+
 // ---- Battery indicator (shared, on top) ----
 static lv_obj_t* battery_img;
 static lv_obj_t* logo_img;
@@ -416,7 +428,55 @@ static void init_sysinfo_screen(lv_obj_t* scr) {
     lv_obj_add_flag(sysinfo_container, LV_OBJ_FLAG_HIDDEN);
 }
 
-// ======== Bluetooth Screen (135x240) ========
+// ======== VS Code Screen (135x240) ========
+// Three 60px panels: Memory, Extensions, Errors. Reuses COPILOT_PANEL_H/GAP constants.
+
+static void init_vscode_screen(lv_obj_t* scr) {
+    vscode_container = lv_obj_create(scr);
+    lv_obj_set_size(vscode_container, SCR_W, SCR_H);
+    lv_obj_set_pos(vscode_container, 0, 0);
+    lv_obj_set_style_bg_opa(vscode_container, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(vscode_container, 0, 0);
+    lv_obj_set_style_pad_all(vscode_container, 0, 0);
+    lv_obj_clear_flag(vscode_container, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(vscode_container, global_click_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t* lbl_vs_title = lv_label_create(vscode_container);
+    lv_label_set_text(lbl_vs_title, "VS Code");
+    lv_obj_set_style_text_font(lbl_vs_title, &font_tiempos_34, 0);
+    lv_obj_set_style_text_color(lbl_vs_title, COL_TEXT, 0);
+    lv_obj_align(lbl_vs_title, LV_ALIGN_TOP_MID, 0, TITLE_Y);
+
+    int y = CONTENT_Y;
+
+    // Panel 1 — Memory (MB)
+    {
+        lv_obj_t* _pill;
+        make_copilot_panel(vscode_container, y, "Memory",
+                           &lbl_vscode_mem, &_pill, &bar_vscode_mem, &lbl_vscode_mem_detail);
+        lv_label_set_text(lbl_vscode_mem, "---");
+    }
+    y += COPILOT_PANEL_H + COPILOT_PANEL_GAP;
+
+    // Panel 2 — Extensions
+    {
+        lv_obj_t* _pill;
+        make_copilot_panel(vscode_container, y, "Ext",
+                           &lbl_vscode_ext, &_pill, &bar_vscode_ext, &lbl_vscode_ext_detail);
+        lv_label_set_text(lbl_vscode_ext, "---");
+    }
+    y += COPILOT_PANEL_H + COPILOT_PANEL_GAP;
+
+    // Panel 3 — Errors
+    {
+        lv_obj_t* _pill;
+        make_copilot_panel(vscode_container, y, "Errors",
+                           &lbl_vscode_err, &_pill, &bar_vscode_err, &lbl_vscode_err_detail);
+        lv_label_set_text(lbl_vscode_err, "---");
+    }
+
+    lv_obj_add_flag(vscode_container, LV_OBJ_FLAG_HIDDEN);
+}
 
 static void init_bluetooth_screen(lv_obj_t* scr) {
     ble_container = lv_obj_create(scr);
@@ -518,6 +578,7 @@ void ui_init(void) {
     init_usage_screen(scr);
     init_copilot_screen(scr);
     init_sysinfo_screen(scr);
+    init_vscode_screen(scr);
     init_bluetooth_screen(scr);
     splash_init(scr);
 
@@ -649,6 +710,64 @@ void ui_update_sysinfo(const SysInfoData* data) {
     lv_label_set_text(lbl_disk_detail, buf);
 }
 
+void ui_update_vscode(const VscodeData* data) {
+    if (!data->valid) return;
+
+    char buf[40];
+
+    // Memory panel — display as "1240MB", bar = pct of 4096MB cap
+    if (data->mem_mb >= 0) {
+        lv_label_set_text_fmt(lbl_vscode_mem, "%dMB", data->mem_mb);
+        int mem_pct = (data->mem_mb * 100) / 4096;
+        if (mem_pct > 100) mem_pct = 100;
+        lv_bar_set_value(bar_vscode_mem, mem_pct, LV_ANIM_ON);
+        lv_obj_set_style_bg_color(bar_vscode_mem, pct_color((float)mem_pct), LV_PART_INDICATOR);
+        if (data->cpu_pct >= 0)
+            snprintf(buf, sizeof(buf), "CPU %d%%", data->cpu_pct);
+        else
+            snprintf(buf, sizeof(buf), "---");
+    } else {
+        lv_label_set_text(lbl_vscode_mem, "---");
+        lv_bar_set_value(bar_vscode_mem, 0, LV_ANIM_OFF);
+        snprintf(buf, sizeof(buf), "---");
+    }
+    lv_label_set_text(lbl_vscode_mem_detail, buf);
+
+    // Extensions panel — count, bar = ext_count/50 capped
+    if (data->ext_count >= 0) {
+        lv_label_set_text_fmt(lbl_vscode_ext, "%d", data->ext_count);
+        int ext_pct = (data->ext_count * 100) / 50;
+        if (ext_pct > 100) ext_pct = 100;
+        lv_bar_set_value(bar_vscode_ext, ext_pct, LV_ANIM_ON);
+        lv_obj_set_style_bg_color(bar_vscode_ext, COL_GREEN, LV_PART_INDICATOR);
+        snprintf(buf, sizeof(buf), "ext hosts");
+    } else {
+        lv_label_set_text(lbl_vscode_ext, "---");
+        lv_bar_set_value(bar_vscode_ext, 0, LV_ANIM_OFF);
+        snprintf(buf, sizeof(buf), "---");
+    }
+    lv_label_set_text(lbl_vscode_ext_detail, buf);
+
+    // Errors panel — count, bar = errors/10 capped, red if any
+    if (data->error_count >= 0) {
+        lv_label_set_text_fmt(lbl_vscode_err, "%d", data->error_count);
+        int err_pct = (data->error_count * 100) / 10;
+        if (err_pct > 100) err_pct = 100;
+        lv_bar_set_value(bar_vscode_err, err_pct > 0 ? err_pct : 1, LV_ANIM_ON);
+        lv_color_t err_col = (data->error_count > 0) ? COL_RED : COL_GREEN;
+        lv_obj_set_style_bg_color(bar_vscode_err, err_col, LV_PART_INDICATOR);
+        if (data->error_count == 0)
+            snprintf(buf, sizeof(buf), "no errors");
+        else
+            snprintf(buf, sizeof(buf), "%.28s", data->last_error);
+    } else {
+        lv_label_set_text(lbl_vscode_err, "---");
+        lv_bar_set_value(bar_vscode_err, 0, LV_ANIM_OFF);
+        snprintf(buf, sizeof(buf), "---");
+    }
+    lv_label_set_text(lbl_vscode_err_detail, buf);
+}
+
 void ui_tick_anim(void) {
     // Copilot screen: advance pixel-art mascot animation
     if (current_screen == SCREEN_COPILOT) {
@@ -708,6 +827,7 @@ void ui_show_screen(screen_t screen) {
     lv_obj_add_flag(usage_container, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(copilot_container, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(sysinfo_container, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(vscode_container, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(ble_container, LV_OBJ_FLAG_HIDDEN);
     splash_hide();
 
@@ -716,6 +836,7 @@ void ui_show_screen(screen_t screen) {
     case SCREEN_USAGE:      lv_obj_clear_flag(usage_container, LV_OBJ_FLAG_HIDDEN); break;
     case SCREEN_COPILOT:    lv_obj_clear_flag(copilot_container, LV_OBJ_FLAG_HIDDEN); break;
     case SCREEN_SYSINFO:    lv_obj_clear_flag(sysinfo_container, LV_OBJ_FLAG_HIDDEN); break;
+    case SCREEN_VSCODE:     lv_obj_clear_flag(vscode_container, LV_OBJ_FLAG_HIDDEN); break;
     case SCREEN_BLUETOOTH:  lv_obj_clear_flag(ble_container, LV_OBJ_FLAG_HIDDEN); break;
     default: break;
     }
@@ -732,7 +853,8 @@ void ui_cycle_screen(void) {
     screen_t next;
     if (current_screen == SCREEN_USAGE)         next = SCREEN_COPILOT;
     else if (current_screen == SCREEN_COPILOT)  next = SCREEN_SYSINFO;
-    else if (current_screen == SCREEN_SYSINFO)  next = SCREEN_BLUETOOTH;
+    else if (current_screen == SCREEN_SYSINFO)  next = SCREEN_VSCODE;
+    else if (current_screen == SCREEN_VSCODE)   next = SCREEN_BLUETOOTH;
     else                                        next = SCREEN_USAGE;
     ui_show_screen(next);
 }
