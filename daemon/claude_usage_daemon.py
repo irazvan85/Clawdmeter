@@ -30,6 +30,7 @@ REQ_CHAR_UUID = "4c41555a-4465-7669-6365-000000000004"
 POLL_INTERVAL = 60
 COPILOT_POLL_INTERVAL = 300  # 5 minutes
 SYSINFO_POLL_INTERVAL = 30   # 30 seconds
+VSCODE_POLL_INTERVAL = 30    # 30 seconds
 TICK = 5
 SCAN_TIMEOUT = 8.0
 
@@ -210,7 +211,114 @@ def poll_sysinfo() -> dict:
     return result
 
 
-def _extract_access_token(blob: str) -> str | None:
+def poll_vscode() -> dict:
+    """Collect VS Code process stats and recent log errors.
+
+    Aggregates all Code/code processes for memory and CPU, counts extension
+    hosts, and scans VS Code log files for errors/criticals in the last 30 min.
+    Returns a dict with src='vscode' ready to send as a BLE JSON payload.
+    """
+    import re as _re
+
+    result: dict = {
+        "src": "vscode",
+        "mm": -1,   # total RSS in MB
+        "vc": -1,   # total CPU %
+        "xe": -1,   # extension host process count
+        "ec": -1,   # error count (last 30 min)
+        "le": "",   # last error snippet
+    }
+
+    # --- Process stats via psutil ---
+    try:
+        import psutil  # type: ignore[import-untyped]
+
+        vscode_procs = []
+        ext_hosts = 0
+        for proc in psutil.process_iter(["name", "cmdline", "memory_info", "cpu_percent", "status"]):
+            try:
+                name = (proc.info["name"] or "").lower()
+                cmdline = " ".join(proc.info["cmdline"] or []).lower()
+                if name in ("code.exe", "code", "code-insiders", "code-insiders.exe") or \
+                        "visual studio code" in cmdline or \
+                        ("/code/" in cmdline and "electron" in cmdline):
+                    vscode_procs.append(proc)
+                    if "extensionhost" in name or "extensionhost" in cmdline:
+                        ext_hosts += 1
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+
+        if vscode_procs:
+            total_rss = sum(
+                p.info["memory_info"].rss for p in vscode_procs
+                if p.info.get("memory_info")
+            )
+            total_cpu = sum(
+                p.info["cpu_percent"] or 0 for p in vscode_procs
+            )
+            result["mm"] = int(total_rss / 1e6)
+            result["vc"] = int(round(total_cpu))
+            result["xe"] = ext_hosts
+
+    except ImportError:
+        log("psutil not installed; skipping vscode poll (pip install psutil)")
+    except Exception as exc:
+        log(f"VS Code process poll error: {exc}")
+
+    # --- Log scan for errors in last 30 min ---
+    try:
+        log_roots = []
+        if sys.platform == "win32":
+            appdata = os.environ.get("APPDATA", "")
+            if appdata:
+                log_roots.append(Path(appdata) / "Code" / "logs")
+                log_roots.append(Path(appdata) / "Code - Insiders" / "logs")
+        elif sys.platform == "darwin":
+            log_roots.append(Path.home() / "Library" / "Application Support" / "Code" / "logs")
+        else:
+            log_roots.append(Path.home() / ".config" / "Code" / "logs")
+
+        cutoff = time.time() - 1800  # 30 minutes
+        error_pat = _re.compile(r"\[error\]|\[critical\]", _re.IGNORECASE)
+        error_count = 0
+        last_error = ""
+
+        for log_root in log_roots:
+            if not log_root.exists():
+                continue
+            # Find all .log files modified in the last 30 min
+            for log_file in sorted(log_root.rglob("*.log"), key=lambda p: p.stat().st_mtime, reverse=True):
+                try:
+                    if log_file.stat().st_mtime < cutoff:
+                        continue
+                    with open(log_file, "r", encoding="utf-8", errors="ignore") as f:
+                        for line in f:
+                            if error_pat.search(line):
+                                error_count += 1
+                                # Keep last error as a short snippet
+                                snippet = line.strip()
+                                # Strip timestamp prefix like "[2024-01-01 12:00:00.000] "
+                                snippet = _re.sub(r"^\[[\d\-T :\.Z]+\]\s*", "", snippet)
+                                snippet = _re.sub(r"\[(?:error|critical)\]\s*", "", snippet, flags=_re.IGNORECASE)
+                                last_error = snippet[:28]
+                except (OSError, PermissionError):
+                    continue
+
+        result["ec"] = error_count
+        result["le"] = last_error
+
+    except Exception as exc:
+        log(f"VS Code log scan error: {exc}")
+        result["ec"] = 0
+
+    log(
+        f"VS Code: mem={result['mm']}MB cpu={result['vc']}% "
+        f"ext_hosts={result['xe']} errors={result['ec']}"
+    )
+    return result
+
+
+
     """Pull the accessToken out of a credentials blob.
 
     Claude Code stores credentials as a JSON object; the blob may also be
@@ -408,6 +516,7 @@ async def connect_and_run(address: str, stop_event: asyncio.Event) -> bool:
     last_poll = 0.0
     last_copilot_poll = 0.0
     last_sysinfo_poll = 0.0
+    last_vscode_poll = 0.0
     used_successfully = False
 
     # Warm up cpu_percent so the first non-blocking call returns a real value
@@ -456,6 +565,13 @@ async def connect_and_run(address: str, stop_event: asyncio.Event) -> bool:
                 last_sysinfo_poll = now
                 si_payload = poll_sysinfo()
                 await session.write_payload(si_payload)
+
+            # VS Code stats poll every 30 seconds
+            now = time.time()
+            if now - last_vscode_poll >= VSCODE_POLL_INTERVAL:
+                last_vscode_poll = now
+                vs_payload = poll_vscode()
+                await session.write_payload(vs_payload)
     finally:
         try:
             await client.disconnect()
