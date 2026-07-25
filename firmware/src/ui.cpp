@@ -35,7 +35,6 @@ LV_FONT_DECLARE(font_mono_18);
 
 // ---- Usage screen widgets ----
 static lv_obj_t* usage_container;
-static lv_obj_t* lbl_title;
 static lv_obj_t* bar_session;
 static lv_obj_t* lbl_session_pct;
 static lv_obj_t* lbl_session_label;
@@ -89,9 +88,16 @@ static lv_obj_t* battery_img;
 static lv_obj_t* logo_img;
 static lv_image_dsc_t battery_dscs[5];  // empty, low, medium, full, charging
 
+// ---- Button-press flash overlay (shared, topmost) ----
+static lv_obj_t* flash_overlay;
+
 // ---- Shared ----
 static lv_image_dsc_t logo_dsc;
 static screen_t current_screen = SCREEN_USAGE;
+// True once the daemon has ever sent sysinfo/vscode data — lets
+// ui_cycle_screen() skip diagnostic screens that have nothing to show.
+static bool sysinfo_has_data = false;
+static bool vscode_has_data = false;
 
 // Animation state
 static uint32_t anim_last_ms = 0;
@@ -163,11 +169,11 @@ static void format_reset_time(int mins, char* buf, size_t len) {
     if (mins < 0) {
         snprintf(buf, len, "---");
     } else if (mins < 60) {
-        snprintf(buf, len, "Resets in %dm", mins);
+        snprintf(buf, len, "Resets %dm", mins);
     } else if (mins < 1440) {
-        snprintf(buf, len, "Resets in %dh %dm", mins / 60, mins % 60);
+        snprintf(buf, len, "Resets %dh %dm", mins / 60, mins % 60);
     } else {
-        snprintf(buf, len, "Resets in %dd %dh", mins / 1440, (mins % 1440) / 60);
+        snprintf(buf, len, "Resets %dd %dh", mins / 1440, (mins % 1440) / 60);
     }
 }
 
@@ -253,6 +259,30 @@ static void init_battery_icons(void) {
     init_icon_dsc_rgb565a8(&battery_dscs[4], ICON_BATTERY_CHARGING_W, ICON_BATTERY_CHARGING_H, icon_battery_charging_data);
 }
 
+// Full-screen transparent container shared by every non-splash screen: same
+// size/position/style every time, optional title label, optional global
+// tap-to-toggle-splash handler (Bluetooth screen opts out — it has its own
+// tap zone for the reset button).
+static lv_obj_t* make_screen_container(lv_obj_t* scr, const char* title, bool clickable) {
+    lv_obj_t* c = lv_obj_create(scr);
+    lv_obj_set_size(c, SCR_W, SCR_H);
+    lv_obj_set_pos(c, 0, 0);
+    lv_obj_set_style_bg_opa(c, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(c, 0, 0);
+    lv_obj_set_style_pad_all(c, 0, 0);
+    lv_obj_clear_flag(c, LV_OBJ_FLAG_SCROLLABLE);
+    if (clickable) lv_obj_add_event_cb(c, global_click_cb, LV_EVENT_CLICKED, NULL);
+
+    if (title) {
+        lv_obj_t* lbl = lv_label_create(c);
+        lv_label_set_text(lbl, title);
+        lv_obj_set_style_text_font(lbl, &font_tiempos_34, 0);
+        lv_obj_set_style_text_color(lbl, COL_TEXT, 0);
+        lv_obj_align(lbl, LV_ALIGN_TOP_MID, 0, TITLE_Y);
+    }
+    return c;
+}
+
 // ======== Usage Screen (135x240) ========
 
 #define PANEL_H     74
@@ -310,20 +340,7 @@ static void make_copilot_panel(lv_obj_t* parent, int y, const char* pill_text,
 }
 
 static void init_usage_screen(lv_obj_t* scr) {
-    usage_container = lv_obj_create(scr);
-    lv_obj_set_size(usage_container, SCR_W, SCR_H);
-    lv_obj_set_pos(usage_container, 0, 0);
-    lv_obj_set_style_bg_opa(usage_container, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(usage_container, 0, 0);
-    lv_obj_set_style_pad_all(usage_container, 0, 0);
-    lv_obj_clear_flag(usage_container, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_event_cb(usage_container, global_click_cb, LV_EVENT_CLICKED, NULL);
-
-    lbl_title = lv_label_create(usage_container);
-    lv_label_set_text(lbl_title, "Usage");
-    lv_obj_set_style_text_font(lbl_title, &font_tiempos_34, 0);
-    lv_obj_set_style_text_color(lbl_title, COL_TEXT, 0);
-    lv_obj_align(lbl_title, LV_ALIGN_TOP_MID, 0, TITLE_Y);
+    usage_container = make_screen_container(scr, "Claude", true);
 
     make_usage_panel(usage_container, CONTENT_Y, "Current",
                      &lbl_session_pct, &lbl_session_label,
@@ -342,20 +359,7 @@ static void init_usage_screen(lv_obj_t* scr) {
 // ======== Copilot Screen (135x240) ========
 
 static void init_copilot_screen(lv_obj_t* scr) {
-    copilot_container = lv_obj_create(scr);
-    lv_obj_set_size(copilot_container, SCR_W, SCR_H);
-    lv_obj_set_pos(copilot_container, 0, 0);
-    lv_obj_set_style_bg_opa(copilot_container, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(copilot_container, 0, 0);
-    lv_obj_set_style_pad_all(copilot_container, 0, 0);
-    lv_obj_clear_flag(copilot_container, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_event_cb(copilot_container, global_click_cb, LV_EVENT_CLICKED, NULL);
-
-    lv_obj_t* lbl_cp_title = lv_label_create(copilot_container);
-    lv_label_set_text(lbl_cp_title, "Copilot");
-    lv_obj_set_style_text_font(lbl_cp_title, &font_tiempos_34, 0);
-    lv_obj_set_style_text_color(lbl_cp_title, COL_TEXT, 0);
-    lv_obj_align(lbl_cp_title, LV_ALIGN_TOP_MID, 0, TITLE_Y);
+    copilot_container = make_screen_container(scr, "Copilot", true);
 
     // Panel 1 — premium request usage %
     {
@@ -382,20 +386,7 @@ static void init_copilot_screen(lv_obj_t* scr) {
 // Three 60px panels: CPU, RAM, Disk. Reuses COPILOT_PANEL_H/GAP constants.
 
 static void init_sysinfo_screen(lv_obj_t* scr) {
-    sysinfo_container = lv_obj_create(scr);
-    lv_obj_set_size(sysinfo_container, SCR_W, SCR_H);
-    lv_obj_set_pos(sysinfo_container, 0, 0);
-    lv_obj_set_style_bg_opa(sysinfo_container, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(sysinfo_container, 0, 0);
-    lv_obj_set_style_pad_all(sysinfo_container, 0, 0);
-    lv_obj_clear_flag(sysinfo_container, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_event_cb(sysinfo_container, global_click_cb, LV_EVENT_CLICKED, NULL);
-
-    lv_obj_t* lbl_si_title = lv_label_create(sysinfo_container);
-    lv_label_set_text(lbl_si_title, "System");
-    lv_obj_set_style_text_font(lbl_si_title, &font_tiempos_34, 0);
-    lv_obj_set_style_text_color(lbl_si_title, COL_TEXT, 0);
-    lv_obj_align(lbl_si_title, LV_ALIGN_TOP_MID, 0, TITLE_Y);
+    sysinfo_container = make_screen_container(scr, "System", true);
 
     int y = CONTENT_Y;
 
@@ -432,20 +423,7 @@ static void init_sysinfo_screen(lv_obj_t* scr) {
 // Three 60px panels: Memory, Extensions, Errors. Reuses COPILOT_PANEL_H/GAP constants.
 
 static void init_vscode_screen(lv_obj_t* scr) {
-    vscode_container = lv_obj_create(scr);
-    lv_obj_set_size(vscode_container, SCR_W, SCR_H);
-    lv_obj_set_pos(vscode_container, 0, 0);
-    lv_obj_set_style_bg_opa(vscode_container, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(vscode_container, 0, 0);
-    lv_obj_set_style_pad_all(vscode_container, 0, 0);
-    lv_obj_clear_flag(vscode_container, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_event_cb(vscode_container, global_click_cb, LV_EVENT_CLICKED, NULL);
-
-    lv_obj_t* lbl_vs_title = lv_label_create(vscode_container);
-    lv_label_set_text(lbl_vs_title, "VS Code");
-    lv_obj_set_style_text_font(lbl_vs_title, &font_tiempos_34, 0);
-    lv_obj_set_style_text_color(lbl_vs_title, COL_TEXT, 0);
-    lv_obj_align(lbl_vs_title, LV_ALIGN_TOP_MID, 0, TITLE_Y);
+    vscode_container = make_screen_container(scr, "VS Code", true);
 
     int y = CONTENT_Y;
 
@@ -479,20 +457,7 @@ static void init_vscode_screen(lv_obj_t* scr) {
 }
 
 static void init_bluetooth_screen(lv_obj_t* scr) {
-    ble_container = lv_obj_create(scr);
-    lv_obj_set_size(ble_container, SCR_W, SCR_H);
-    lv_obj_set_pos(ble_container, 0, 0);
-    lv_obj_set_style_bg_opa(ble_container, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(ble_container, 0, 0);
-    lv_obj_set_style_pad_all(ble_container, 0, 0);
-    lv_obj_clear_flag(ble_container, LV_OBJ_FLAG_SCROLLABLE);
-
-    // Title
-    lv_obj_t* lbl_ble_title = lv_label_create(ble_container);
-    lv_label_set_text(lbl_ble_title, "Bluetooth");
-    lv_obj_set_style_text_font(lbl_ble_title, &font_tiempos_34, 0);
-    lv_obj_set_style_text_color(lbl_ble_title, COL_TEXT, 0);
-    lv_obj_align(lbl_ble_title, LV_ALIGN_TOP_MID, 0, TITLE_Y);
+    ble_container = make_screen_container(scr, "Bluetooth", false);
 
     // Info panel
     lv_obj_t* p_info = make_panel(ble_container, MARGIN, CONTENT_Y, CONTENT_W, 108);
@@ -598,6 +563,20 @@ void ui_init(void) {
     lv_image_set_src(battery_img, &battery_dscs[0]);
     lv_obj_set_pos(battery_img, SCR_W - 48 - MARGIN, TITLE_Y);
     lv_obj_add_flag(battery_img, LV_OBJ_FLAG_HIDDEN);
+
+    // Button-press flash overlay: fullscreen, non-clickable, topmost.
+    // Starts fully transparent; ui_flash_feedback() pulses it briefly to
+    // confirm a press was registered (no haptics on this board).
+    flash_overlay = lv_obj_create(scr);
+    lv_obj_set_size(flash_overlay, SCR_W, SCR_H);
+    lv_obj_set_pos(flash_overlay, 0, 0);
+    lv_obj_set_style_bg_color(flash_overlay, COL_ACCENT, 0);
+    lv_obj_set_style_bg_opa(flash_overlay, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(flash_overlay, 0, 0);
+    lv_obj_set_style_radius(flash_overlay, 0, 0);
+    lv_obj_clear_flag(flash_overlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_clear_flag(flash_overlay, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_move_foreground(flash_overlay);
 }
 
 void ui_update(const UsageData* data) {
@@ -662,6 +641,7 @@ void ui_update_copilot(const CopilotData* data) {
 
 void ui_update_sysinfo(const SysInfoData* data) {
     if (!data->valid) return;
+    sysinfo_has_data = true;
 
     char buf[40];
 
@@ -712,6 +692,7 @@ void ui_update_sysinfo(const SysInfoData* data) {
 
 void ui_update_vscode(const VscodeData* data) {
     if (!data->valid) return;
+    vscode_has_data = true;
 
     char buf[40];
 
@@ -850,12 +831,20 @@ void ui_show_screen(screen_t screen) {
 }
 
 void ui_cycle_screen(void) {
-    screen_t next;
-    if (current_screen == SCREEN_USAGE)         next = SCREEN_COPILOT;
-    else if (current_screen == SCREEN_COPILOT)  next = SCREEN_SYSINFO;
-    else if (current_screen == SCREEN_SYSINFO)  next = SCREEN_VSCODE;
-    else if (current_screen == SCREEN_VSCODE)   next = SCREEN_BLUETOOTH;
-    else                                        next = SCREEN_USAGE;
+    screen_t next = current_screen;
+    do {
+        if (next == SCREEN_USAGE)         next = SCREEN_COPILOT;
+        else if (next == SCREEN_COPILOT)  next = SCREEN_SYSINFO;
+        else if (next == SCREEN_SYSINFO)  next = SCREEN_VSCODE;
+        else if (next == SCREEN_VSCODE)   next = SCREEN_BLUETOOTH;
+        else                              next = SCREEN_USAGE;
+        // Skip diagnostic screens that have never received data from the
+        // daemon (e.g. psutil not installed on host) so cycling only
+        // surfaces screens with real content.
+        if (next == SCREEN_SYSINFO && !sysinfo_has_data) continue;
+        if (next == SCREEN_VSCODE && !vscode_has_data) continue;
+        break;
+    } while (true);
     ui_show_screen(next);
 }
 
@@ -920,4 +909,24 @@ void ui_update_battery(int percent, bool charging) {
     }
     lv_image_set_src(battery_img, &battery_dscs[idx]);
     apply_battery_visibility();
+}
+
+// ---- Button-press flash overlay ----
+// Brief brand-accent pulse on the top layer to confirm a physical button
+// press was registered (no haptics on this board). Non-clickable so it
+// never intercepts taps meant for the screen underneath.
+static void flash_anim_cb(void* obj, int32_t v) {
+    lv_obj_set_style_bg_opa((lv_obj_t*)obj, (lv_opa_t)v, 0);
+}
+
+void ui_flash_feedback(void) {
+    if (!flash_overlay) return;
+    lv_obj_set_style_bg_opa(flash_overlay, 70, 0);
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, flash_overlay);
+    lv_anim_set_exec_cb(&a, flash_anim_cb);
+    lv_anim_set_values(&a, 70, 0);
+    lv_anim_set_duration(&a, 160);
+    lv_anim_start(&a);
 }

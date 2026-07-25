@@ -62,7 +62,7 @@ static void send_screenshot() {
     const uint32_t buf_size = row_bytes * h;
     uint8_t* sbuf = (uint8_t*)malloc(buf_size);
     if (!sbuf) {
-        Serial.println("SCREENSHOT_ERR");
+        Serial.printf("SCREENSHOT_ERR malloc buf_size=%lu free_heap=%lu max_alloc=%lu\n", (unsigned long)buf_size, (unsigned long)ESP.getFreeHeap(), (unsigned long)ESP.getMaxAllocHeap());
         return;
     }
 
@@ -72,7 +72,7 @@ static void send_screenshot() {
     lv_result_t res = lv_snapshot_take_to_draw_buf(lv_screen_active(), LV_COLOR_FORMAT_RGB565, &draw_buf);
     if (res != LV_RESULT_OK) {
         free(sbuf);
-        Serial.println("SCREENSHOT_ERR");
+        Serial.printf("SCREENSHOT_ERR snapshot res=%d free_heap=%lu\n", (int)res, (unsigned long)ESP.getFreeHeap());
         return;
     }
 
@@ -148,7 +148,7 @@ void setup() {
     // Show initial battery status
     ui_update_battery(power_battery_pct(), power_is_charging());
 
-    ui_show_screen(SCREEN_SPLASH);
+    ui_show_screen(SCREEN_USAGE);
 
     Serial.println("Dashboard ready, waiting for data on BLE...");
 }
@@ -172,6 +172,7 @@ void loop() {
         bool back_now = (digitalRead(BTN_BACK) == LOW);
 
         if (back_now && !back_was) {
+            ui_flash_feedback();
             if (ui_get_current_screen() == SCREEN_SPLASH) ui_show_screen(SCREEN_USAGE);
             else                                          ui_cycle_screen();
         }

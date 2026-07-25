@@ -37,8 +37,18 @@ SCAN_TIMEOUT = 8.0
 # macOS: token lives in Keychain (service "Claude Code-credentials").
 # Linux: token lives in ~/.claude/.credentials.json.
 KEYCHAIN_SERVICE = "Claude Code-credentials"
-CREDENTIALS_PATH = Path.home() / ".claude" / ".credentials.json"
+DEFAULT_CONFIG_DIR = Path.home() / ".claude"
+CREDENTIALS_PATH = DEFAULT_CONFIG_DIR / ".credentials.json"
+CONFIG_FILE = Path.home() / ".config" / "claude-usage-monitor" / "config"
 SAVED_ADDR_FILE = Path.home() / ".config" / "claude-usage-monitor" / "ble-address"
+TOKEN_ENV_VARS = (
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "ANTHROPIC_AUTH_TOKEN",
+    "CLAUDE_ACCESS_TOKEN",
+    "ANTHROPIC_API_KEY",
+)
+
+_missing_token_logged = False
 
 API_URL = "https://api.anthropic.com/v1/messages"
 API_HEADERS_TEMPLATE = {
@@ -319,6 +329,7 @@ def poll_vscode() -> dict:
 
 
 
+def _extract_access_token(blob: str) -> str | None:
     """Pull the accessToken out of a credentials blob.
 
     Claude Code stores credentials as a JSON object; the blob may also be
@@ -333,14 +344,29 @@ def poll_vscode() -> dict:
         data = json.loads(blob)
     except json.JSONDecodeError:
         data = None
-    if isinstance(data, dict):
-        # direct: {"accessToken": "..."}
-        if isinstance(data.get("accessToken"), str):
-            return data["accessToken"]
-        # nested: {"claudeAiOauth": {"accessToken": "..."}}
-        for v in data.values():
-            if isinstance(v, dict) and isinstance(v.get("accessToken"), str):
-                return v["accessToken"]
+    if isinstance(data, (dict, list)):
+        # Recursively search nested JSON for a non-empty accessToken.
+        def walk(node: object) -> str | None:
+            if isinstance(node, dict):
+                v = node.get("accessToken")
+                if isinstance(v, str):
+                    t = v.strip()
+                    if t:
+                        return t
+                for child in node.values():
+                    hit = walk(child)
+                    if hit:
+                        return hit
+            elif isinstance(node, list):
+                for child in node:
+                    hit = walk(child)
+                    if hit:
+                        return hit
+            return None
+
+        token = walk(data)
+        if token:
+            return token
     m = re.search(r'"accessToken"\s*:\s*"([^"]+)"', blob)
     if m:
         return m.group(1)
@@ -376,19 +402,96 @@ def _read_token_keychain() -> str | None:
     return _extract_access_token(out.stdout)
 
 
-def _read_token_file() -> str | None:
+def read_config_dirs() -> list[Path]:
+    """Claude config dirs from config_dirs in daemon config (comma-separated).
+
+    Defaults to [~/.claude] when unset.
+    """
+    raw = ""
     try:
-        raw = CREDENTIALS_PATH.read_text()
+        if CONFIG_FILE.exists():
+            for line in CONFIG_FILE.read_text(encoding="utf-8").splitlines():
+                line = line.split("#", 1)[0].strip()
+                if "=" not in line:
+                    continue
+                key, val = line.split("=", 1)
+                if key.strip().lower() == "config_dirs":
+                    raw = val.strip()
+    except OSError:
+        pass
+
+    if not raw:
+        return [DEFAULT_CONFIG_DIR]
+
+    dirs = [Path(p.strip()).expanduser() for p in raw.split(",") if p.strip()]
+    return dirs or [DEFAULT_CONFIG_DIR]
+
+
+def _read_token_file(config_dir: Path) -> str | None:
+    cred_file = config_dir / ".credentials.json"
+    try:
+        raw = cred_file.read_text(encoding="utf-8")
     except OSError as e:
-        log(f"Error reading credentials: {e}")
+        log(f"Error reading credentials in {config_dir}: {e}")
         return None
     return _extract_access_token(raw)
 
 
-def read_token() -> str | None:
-    if sys.platform == "darwin":
+def _read_token_env() -> str | None:
+    for env_name in TOKEN_ENV_VARS:
+        val = os.getenv(env_name, "").strip()
+        if val:
+            return val
+    return None
+
+
+def read_token_for(config_dir: Path) -> str | None:
+    token = _read_token_env()
+    if token:
+        return token
+
+    token = _read_token_file(config_dir)
+    if token:
+        return token
+
+    # Preserve the original macOS behavior: default profile can come from
+    # Keychain with no on-disk token file.
+    if sys.platform == "darwin" and config_dir == DEFAULT_CONFIG_DIR:
         return _read_token_keychain()
-    return _read_token_file()
+
+    return None
+
+
+def read_token() -> str | None:
+    global _missing_token_logged
+
+    # Keep this helper for compatibility; first non-empty token wins.
+    for cfg_dir in read_config_dirs():
+        token = read_token_for(cfg_dir)
+        if token:
+            return token
+
+    if not _missing_token_logged:
+        log(
+            "No Claude OAuth token found. Expected a non-empty accessToken in "
+            "<config_dir>/.credentials.json for config_dirs from "
+            f"{CONFIG_FILE} (default {DEFAULT_CONFIG_DIR}) or one of "
+            f"{', '.join(TOKEN_ENV_VARS)}"
+        )
+        _missing_token_logged = True
+    return None
+
+
+async def poll_active_payload() -> dict | None:
+    """Poll configured Claude config dirs and return the first valid payload."""
+    for cfg_dir in read_config_dirs():
+        token = read_token_for(cfg_dir)
+        if not token:
+            continue
+        payload = await poll_api(token)
+        if payload is not None:
+            return payload
+    return None
 
 
 def load_cached_address() -> str | None:
@@ -430,12 +533,20 @@ async def poll_api(token: str) -> dict | None:
     except httpx.HTTPError as e:
         log(f"API call failed: {e}")
         return None
-    if resp.status_code >= 400:
-        log(f"API HTTP {resp.status_code}: {resp.text[:200]}")
-        return None
 
     def hdr(name: str, default: str = "0") -> str:
         return resp.headers.get(name, default)
+
+    # Even on 429/other non-2xx, Anthropic returns ratelimit headers that are
+    # sufficient to render usage + reset timers on-device. Keep using them.
+    s5h_u = hdr("anthropic-ratelimit-unified-5h-utilization", "")
+    s5h_r = hdr("anthropic-ratelimit-unified-5h-reset", "")
+    s7d_u = hdr("anthropic-ratelimit-unified-7d-utilization", "")
+    s7d_r = hdr("anthropic-ratelimit-unified-7d-reset", "")
+    if resp.status_code >= 400:
+        log(f"API HTTP {resp.status_code}: {resp.text[:200]}")
+        if not (s5h_u and s5h_r and s7d_u and s7d_r):
+            return None
 
     now = time.time()
 
@@ -454,12 +565,12 @@ async def poll_api(token: str) -> dict | None:
             return 0
 
     payload = {
-        "s": pct(hdr("anthropic-ratelimit-unified-5h-utilization")),
-        "sr": reset_minutes(hdr("anthropic-ratelimit-unified-5h-reset")),
-        "w": pct(hdr("anthropic-ratelimit-unified-7d-utilization")),
-        "wr": reset_minutes(hdr("anthropic-ratelimit-unified-7d-reset")),
+        "s": pct(s5h_u),
+        "sr": reset_minutes(s5h_r),
+        "w": pct(s7d_u),
+        "wr": reset_minutes(s7d_r),
         "st": hdr("anthropic-ratelimit-unified-5h-status", "unknown"),
-        "ok": True,
+        "ok": resp.status_code < 400,
     }
     return payload
 
@@ -482,6 +593,12 @@ class Session:
     async def write_payload(self, payload: dict) -> bool:
         data = json.dumps(payload, separators=(",", ":")).encode()
         log(f"Sending: {data.decode()}")
+
+        # Double‑check connection before writing
+        if not self.client.is_connected:
+            log("❌ BLE client not connected – cannot write")
+            return False
+
         try:
             await self.client.write_gatt_char(RX_CHAR_UUID, data, response=False)
             return True
@@ -532,15 +649,12 @@ async def connect_and_run(address: str, stop_event: asyncio.Event) -> bool:
             elapsed = now - last_poll
             if session.refresh_requested.is_set() or elapsed >= POLL_INTERVAL:
                 session.refresh_requested.clear()
-                token = read_token()
-                if not token:
-                    log("No token; skipping poll")
-                else:
-                    payload = await poll_api(token)
-                    if payload is not None:
-                        if await session.write_payload(payload):
-                            last_poll = time.time()
-                            used_successfully = True
+                payload = await poll_active_payload()
+                if payload is None:
+                    log("No Claude payload; skipping poll")
+                elif await session.write_payload(payload):
+                    last_poll = time.time()
+                    used_successfully = True
 
             try:
                 await asyncio.wait_for(session.refresh_requested.wait(), timeout=TICK)
@@ -596,7 +710,7 @@ async def main() -> None:
         except NotImplementedError:
             signal.signal(sig, _stop)
 
-    log("=== Claude Usage Tracker Daemon (BLE, macOS) ===")
+    log("=== Claude Usage Tracker Daemon (BLE) ===")
     log(f"Poll interval: {POLL_INTERVAL}s")
 
     backoff = 1
