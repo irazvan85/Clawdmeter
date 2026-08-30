@@ -221,7 +221,7 @@ Payloads are compact JSON written to RX, routed by a `src` field (default
 
 | `src`     | Fields                                                                 |
 | --------- | --------------------------------------------------------------------- |
-| `claude`  | `s` session %, `sr` session reset (min), `w` weekly %, `wr` weekly reset (min), `st` status, `ok` |
+| `claude`  | `s` session %, `sr` session reset (min), `w` weekly %, `wr` weekly reset (min), `st` status, `ok`, `mdl` model short name, `ctx` context-window % |
 | `copilot` | `pp` premium % used, `pr` remaining, `pe` entitlement, `prm` reset (min), `prd` reset date, `plan`, `en` |
 | `sysinfo` | `cpu` %, `ct` °C, `rp` RAM %, `ru`/`rt` RAM GB, `dp` disk %, `du`/`dt` disk GB |
 | `vscode`  | `mm` RSS MB, `vc` CPU %, `xe` ext-host count, `ec` error count, `le` last error |
@@ -229,7 +229,6 @@ Payloads are compact JSON written to RX, routed by a `src` field (default
 | `act`     | `st` — `idle` / `working` / `needs_input` / `done`; `n` concurrent sessions; `age` secs |
 | `ci`      | `state` `pass`/`fail`/`running`/`none`; `wf` workflow, `br` branch, `age` min; `rev`/`chg` review counts; `dty`/`ah`/`bh`/`cf` git |
 | `sum`     | `am` active min, `tk` k-tokens, `usd` cost est, `cm` commits, `cp` Copilot used (today) |
-| `claude`  | (also) `mdl` model short name, `ctx` context-window % |
 | `status`  | `state` — `ok`, `no_token`, `api_error`                              |
 
 ```json
