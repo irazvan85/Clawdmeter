@@ -20,9 +20,9 @@ SETTINGS = Path.home() / ".claude" / "settings.json"
 HOOK_SCRIPT = Path(__file__).resolve().parent / "hook.py"
 EVENTS = ("UserPromptSubmit", "Stop", "SubagentStop", "Notification",
           "SessionStart", "SessionEnd")
-# Our hook command always ends in ".../daemon/hook.py" — enough of a marker to
-# find and replace it without touching anyone else's hooks.
-MARKER = "hook.py"
+# Our hook command includes the absolute hook.py path; use that as a marker to
+# avoid touching unrelated hooks.
+MARKER = str(HOOK_SCRIPT)
 
 
 def _command() -> str:
@@ -32,7 +32,6 @@ def _command() -> str:
 
 def _is_ours(hook: object) -> bool:
     return isinstance(hook, dict) and MARKER in str(hook.get("command", ""))
-
 
 def load() -> dict:
     try:
