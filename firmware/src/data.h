@@ -7,6 +7,8 @@ struct UsageData {
     float weekly_pct;        // 7-day window utilization (0-100)
     int weekly_reset_mins;   // minutes until weekly resets
     char status[16];         // "allowed" or "limited"
+    char model[12];          // active session model, short ("Sonnet"); "" if unknown
+    int  ctx_pct;            // active session context-window usage %, -1 if unknown
     bool ok;                 // data parse succeeded
     bool valid;              // false until first successful parse
 };
@@ -41,4 +43,28 @@ struct VscodeData {
     int error_count;    // error/critical log lines in last 30 min; -1 if unavailable
     char last_error[32];// last error snippet (truncated); empty if none
     bool valid;         // false until first successful parse
+};
+
+struct CiData {
+    char state[10];    // "pass" | "fail" | "running" | "none"
+    char wf[20];       // workflow name
+    char branch[24];   // branch the run/repo is on
+    int  age_min;      // minutes since the run finished/started; -1 unknown
+    int  review;       // open PRs awaiting my review
+    int  changes;      // my PRs with failing checks or changes requested
+    int  dirty;        // changed files in the working tree; -1 unknown
+    int  ahead, behind;
+    bool conflict;
+    bool valid;
+};
+
+struct EnvData {
+    long epoch;          // unix seconds (UTC) at the moment the daemon sent this
+    int  tz_off_min;     // local UTC offset in minutes (DST already resolved host-side)
+    int  temp_c;         // current temperature °C
+    int  hi_c, lo_c;     // today's high / low °C
+    int  wcode;          // WMO weather code (open-meteo); -1 if unavailable
+    char loc[16];        // short location name, e.g. "Bucharest"
+    bool has_weather;    // false → time only (weather fetch failed)
+    bool valid;          // false until first successful parse
 };

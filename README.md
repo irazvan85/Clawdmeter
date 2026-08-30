@@ -2,225 +2,270 @@
 
 A small ESP32 dashboard I made for my desk to keep an eye on Claude Code usage.
 
-It runs on a [Waveshare ESP32-S3-Touch-AMOLED-2.16](https://www.waveshare.com/esp32-s3-touch-amoled-2.16.htm?&aff_id=149786) and pairs with my laptop over Bluetooth, the splash screen plays pixel-art Clawd animations that get
-busier when your usage rate climbs. The two side buttons send Space and
-Shift+Tab over BLE HID for Claude Code's voice mode and mode-toggle shortcuts.
+It runs on an **[ideaspark ESP32 1.14" ST7789](https://www.aliexpress.com/item/1005006470918484.html)** board
+(135×240 IPS SPI LCD, ESP32-WROOM-32) and pairs with my laptop over Bluetooth
+LE. A host daemon polls the Anthropic API for usage and pushes it to the
+display. The splash screen plays pixel-art Clawd animations that get busier as
+your usage rate climbs.
 
-|              Usage meter              |              Clawd animation screen              |
-| :-----------------------------------: | :----------------------------------------------: |
-| ![Usage meter](assets/demo.jpeg) | ![Clawd animation screen](assets/demo.gif) |
+|                 Splash                 |                   Clock                    |               Claude usage               |
+| :------------------------------------: | :----------------------------------------: | :--------------------------------------: |
+| ![Splash](screenshots/splash.png)      | ![Clock](screenshots/clock.png)            | ![Usage](screenshots/usage.png)          |
+| Boots here; mood follows Claude activity | Time, date, weather + usage strip; long-press for a focus timer | Session/weekly, model + context %, "safe to run?" |
 
-The Clawd animations come from [claudepix](https://claudepix.vercel.app), [@amaanbuilds](https://x.com/amaanbuilds)'s library of pixel-art Clawd sprites, check it out, it's lovely.
+|               Checks                 |                 Today                  |                Bluetooth                 |
+| :----------------------------------: | :------------------------------------: | :--------------------------------------: |
+| ![Checks](screenshots/checks.png)    | ![Today](screenshots/today.png)        | ![Bluetooth](screenshots/bluetooth.png)  |
+| CI run, review queue, git working tree | Claude time, tokens, cost, commits    | Connection, device MAC, unpair           |
 
-## Screens
+The Clawd animations come from [claudepix](https://claudepix.vercel.app),
+[@amaanbuilds](https://x.com/amaanbuilds)'s library of pixel-art Clawd sprites — check it out, it's lovely.
 
-The device boots into the splash and stays there until you press the middle (PWR) button, which cycles between Usage and Bluetooth. Tap the screen anywhere (except the Reset zone on the Bluetooth screen) to flip back to the splash; tap again to dismiss it.
-
-|              Splash               |              Usage              |                Bluetooth                |
-| :-------------------------------: | :-----------------------------: | :-------------------------------------: |
-| ![Splash](screenshots/splash.png) | ![Usage](screenshots/usage.png) | ![Bluetooth](screenshots/bluetooth.png) |
-|   Splash; touch-toggle anytime    | Session and weekly utilization  |    Connection status and bond reset     |
-
-While the splash is up, the middle button cycles animations instead of screens. The firmware also auto-rotates every 20 s within the current usage-rate group, so a long stretch on the splash isn't just one Clawd on loop.
+> Earlier versions targeted the Waveshare ESP32-S3-Touch-AMOLED-2.16 (480×480,
+> touch, PMU, IMU). That hardware and its three-button HID setup are gone — see
+> git history. This board has **one button and no touch**.
 
 ## Hardware
 
-- [Waveshare ESP32-S3-Touch-AMOLED-2.16](https://www.waveshare.com/esp32-s3-touch-amoled-2.16.htm?&aff_id=149786) - ESP32-S3R8, 2.16" 480×480 AMOLED (CO5300 QSPI), CST9220 cap touch, AXP2101 PMU + Li-Po battery, QMI8658 IMU
-- USB-C cable for flashing firmware and charging
-- 3.7V Li-Po battery (MX1.25 2-pin connector, optional)
+- **ideaspark ESP32 1.14" ST7789** — ESP32-WROOM-32 (240 MHz, 320 KB SRAM, 4 MB flash, no PSRAM), ST7789 135×240 IPS LCD over SPI, CH340 USB-serial
+- No touch, no battery/PMU, no IMU
+- One usable button: **GPIO 0 (BOOT)**. GPIO 18 is the LCD clock and can't be a button.
+- A USB-C (or micro-USB, depending on the batch) cable for flashing and power
 
-## Prerequisites
+Pin map lives in [`firmware/src/display_cfg.h`](firmware/src/display_cfg.h);
+board notes are in [`doc/`](doc/) and [`CLAUDE.md`](CLAUDE.md).
 
-- Linux (tested on Ubuntu) or macOS
-- [PlatformIO CLI](https://docs.platformio.org/en/latest/core/installation/index.html)
-- Linux: `curl`, `bluetoothctl`, `busctl` (BlueZ Bluetooth stack)
-- macOS: `python3` (the installer sets up a venv with `bleak` and `httpx`)
-- Claude Code with an active subscription
+## Screens and the button
 
-## macOS installation
+The device boots into the splash and waits there. One button drives everything:
 
-The macOS host pieces — Python daemon, LaunchAgent, and flash helper — were ported by [Chris Davidson (@lorddavidson)](https://github.com/lorddavidson). Thanks Chris!
+| Gesture                       | Action                                                                                     |
+| ----------------------------- | ----------------------------------------------------------------------------------------- |
+| **Short press**               | Next screen: Splash → Clock → Claude → Copilot → System → VS Code → Bluetooth → Checks → Today → Splash → … |
+| **Long press** (≥ 0.7 s)      | Fresh daemon poll. On **Bluetooth**: clear the BLE bond. On **Clock**: start / stop a 25-5 focus timer. |
 
-### Flash the firmware
+The **Clock** screen shows the time, date, and local weather, with a two-bar
+strip along the bottom — Claude session % and Copilot premium % — so the
+headline usage numbers are visible even when it isn't the usage screen. Time
+and weather come from the daemon (`src:"env"`); the device keeps the clock
+ticking between updates.
+
+System and VS Code are skipped in the cycle until the daemon has sent data for
+them (they need `psutil` on the host). While the splash is showing it
+auto-rotates every 20 s, following the Claude-activity signal (idle / working /
+needs-you) when it's available and the usage-rate group otherwise.
+
+### Activity signal
+
+A small dot next to the freshness pill shows what Claude Code is doing —
+grey idle, terracotta working, red waiting on you. When Claude needs input
+(a permission prompt, plan approval), a **"Claude needs you"** banner drops in
+and the screen flashes once; any short press dismisses it. On the Claude screen,
+the bottom line reads the quota verdict — **safe to run** / **cap ~1h40m** /
+**cap imminent** — from the measured session burn rate.
+
+This works out of the box from transcript activity, but installing the Claude
+Code hooks makes it precise (adds the "needs you" state):
 
 ```bash
-./flash-mac.sh                       # auto-detects /dev/cu.usbmodem*
-./flash-mac.sh /dev/cu.usbmodem1101  # or pass an explicit USB serial port
+python daemon/install_hooks.py            # merges into ~/.claude/settings.json
+python daemon/install_hooks.py --remove   # undo
 ```
 
-### Pair the device
+The top-right of every data screen shows a freshness pill: seconds/minutes since
+the last update (green → amber as it ages), or `stale` / `offline` / `waiting` /
+a daemon error like `no token` when something's wrong. If the link goes quiet
+the "working" animation on the Claude screen stops, so a frozen number never
+looks live.
 
-After flashing, open **System Settings → Bluetooth** and click *Connect* next to "Clawdmeter". The daemon will discover it on its next scan (~30 s).
+### Checks &amp; Today
 
-### Install the daemon
+**Checks** shows the latest CI run for the repo you're in (resolved from the
+open VS Code / Claude Code workspace), the git working-tree state, and how many
+PRs are waiting on your review — via `gh`, so run `gh auth login` once.
+**Today** totals your Claude time, tokens, cost estimate, commits, and Copilot
+requests since local midnight. Both are skipped in the cycle until they have data.
 
-The daemon reads your Claude OAuth token from the macOS Keychain (service `Claude Code-credentials`), polls usage every 60 s, and pushes it to the display over BLE.
+The Claude screen also shows the active model and context-window % (amber past
+70%, red past 85% — heads-up before Claude Code auto-compacts).
 
-```bash
-./install-mac.sh
+### Backlight
+
+Steady at full brightness; **breathes** gently while Claude is working (a
+peripheral "still going" cue); dims to ~35% after 10 minutes with no button
+press. Any press brings it back.
+
+## Build and flash
+
+[PlatformIO](https://docs.platformio.org/en/latest/core/installation/index.html) drives the build. On Windows the board shows up as a CH340 port (COM13 here):
+
+```powershell
+# Build
+& "$env:USERPROFILE\.platformio\penv\Scripts\pio.exe" run -d firmware
+
+# Flash (swap in your port)
+& "$env:USERPROFILE\.platformio\penv\Scripts\pio.exe" run -d firmware -t upload --upload-port COM13
 ```
 
-The installer creates a Python venv in `daemon/.venv/`, installs `bleak` and `httpx`, renders a LaunchAgent into `~/Library/LaunchAgents/com.user.claude-usage-daemon.plist`, and loads it. The first run is launched interactively so macOS prompts for Bluetooth permission.
+On macOS/Linux `pio run -d firmware -t upload --upload-port <port>` works the
+same; the `flash.sh` / `flash-mac.sh` helpers auto-detect the port.
 
-Useful commands:
+Hold BOOT while tapping EN if the chip doesn't enter download mode on its own
+(rarely needed).
 
-```bash
-launchctl list | grep claude-usage                                          # check it's running
-tail -F ~/Library/Logs/claude-usage-daemon.out.log                          # live logs
-launchctl unload ~/Library/LaunchAgents/com.user.claude-usage-daemon.plist  # stop
-launchctl load -w ~/Library/LaunchAgents/com.user.claude-usage-daemon.plist # start
+### Screenshots
+
+`tools/screenshot.py` pulls the LVGL framebuffer over serial and writes a PNG
+(pure stdlib + pyserial — no ffmpeg):
+
+```powershell
+& "$env:USERPROFILE\.platformio\penv\Scripts\python.exe" tools/screenshot.py screenshots/usage.png COM13
 ```
 
-## Linux installation
+Two serial commands help here: `screen <0-6>` jumps straight to a screen
+(0 = splash, 1 = clock … 6 = Bluetooth), and `feed <json>` injects a payload as if it
+arrived over BLE (e.g. `feed {"s":47,"sr":138,"w":22,"wr":5400}`).
+`screenshot.py --screen=N --feed='<json>'` does both before capturing.
+`screenshot.sh` is the older bash + ffmpeg version.
 
-### Flash the firmware
+## Host daemon
 
-```bash
-cd firmware
-pio run -t upload --upload-port /dev/ttyACM0
+The daemon reads your Claude Code OAuth token, makes a minimal API call
+(`api.anthropic.com/v1/messages`, one Haiku token — effectively free), reads the
+usage numbers out of the `anthropic-ratelimit-unified-*` response headers, and
+writes a JSON payload to the device over a GATT characteristic. It also tracks
+the rate of change of session % and the device uses that to pick a splash
+animation mood.
+
+- **`daemon/claude_usage_daemon.py`** (macOS, Windows, and Linux via BlueZ) — also
+  polls GitHub Copilot premium-request quota, host CPU/RAM/disk, VS Code process
+  stats, and the time + local weather for the Clock screen. It sends a `status`
+  frame when the Claude poll can't run so the device can show *why*.
+- **`daemon/claude-usage-daemon.sh`** (Linux, `bluetoothctl` + `busctl`) — Claude
+  usage only.
+
+Weather uses [open-meteo](https://open-meteo.com) (no key). It defaults to
+**Timișoara, Romania**; set a location in `~/.config/claude-usage-monitor/config`:
+
+```ini
+location = Berlin        # any city name — geocoded, result cached
+# or pin exact coordinates (these win over `location`):
+# lat = 48.85
+# lon = 2.35
 ```
 
-### Pair the device
+### macOS
 
-After flashing, the device advertises as "Claudemeter". Pair it once:
+The macOS pieces were ported by [Chris Davidson (@lorddavidson)](https://github.com/lorddavidson) — thanks Chris.
 
 ```bash
-# Scan for the device
-bluetoothctl scan le
-
-# When "Claude Controller" appears, pair and trust it
-bluetoothctl pair F4:12:FA:C0:8F:E5    # use your device's MAC
-bluetoothctl trust F4:12:FA:C0:8F:E5
+./flash-mac.sh              # auto-detects /dev/cu.usbmodem*
+./install-mac.sh            # venv + LaunchAgent, first run is interactive for the BT permission prompt
 ```
 
-The MAC address is shown on the Bluetooth screen — press the middle (PWR) button to cycle to it.
-
-### Install the daemon
-
-The daemon polls your Claude usage every 60 seconds and sends it to the display over BLE.
+The daemon reads the token from the Keychain (service `Claude Code-credentials`). Useful commands:
 
 ```bash
+launchctl list | grep claude-usage
+tail -F ~/Library/Logs/claude-usage-daemon.out.log
+launchctl unload ~/Library/LaunchAgents/com.user.claude-usage-daemon.plist   # stop
+launchctl load -w ~/Library/LaunchAgents/com.user.claude-usage-daemon.plist  # start
+```
+
+### Linux
+
+```bash
+cd firmware && pio run -t upload --upload-port /dev/ttyACM0
 ./install.sh
 systemctl --user start claude-usage-daemon
 ```
 
-Check status: `systemctl --user status claude-usage-daemon`
+Pair once (the MAC is on the device's Bluetooth screen):
 
-View logs: `journalctl --user -u claude-usage-daemon -f`
+```bash
+bluetoothctl scan le                       # wait for "Claude Controller"
+bluetoothctl pair   F4:12:FA:C0:8F:E5      # your MAC
+bluetoothctl trust  F4:12:FA:C0:8F:E5
+```
 
-## How it works
+Status: `systemctl --user status claude-usage-daemon` · Logs: `journalctl --user -u claude-usage-daemon -f`
 
-1. The daemon reads your Claude Code OAuth token from `~/.claude/.credentials.json`.
-2. It makes a minimal API call to `api.anthropic.com/v1/messages` — one token of Haiku, basically free.
-3. The usage numbers come straight out of the response headers (`anthropic-ratelimit-unified-5h-utilization` and friends).
-4. The daemon connects to the ESP32 over BLE and writes a JSON payload to the GATT RX characteristic.
-5. The firmware parses it and updates the LVGL dashboard.
-6. The firmware also tracks the rate of change of session % over a 5-minute window and picks splash animations from the matching mood group.
-7. The two side buttons are independent of all of this — they send Space and Shift+Tab as BLE HID keyboard input to the paired host directly.
+### Windows
 
-## Physical buttons
+Run the Python daemon directly (a venv with `bleak` + `httpx` + `psutil`; see
+`daemon/requirements.txt`). Pair "Claude Controller" once from **Settings →
+Bluetooth & devices**, then:
 
-The board has three side buttons. Left and right do the same thing on every screen; the middle button is screen-aware.
+```powershell
+python daemon\claude_usage_daemon.py
+```
 
-| Button           | GPIO         | Function                                                       |
-| ---------------- | ------------ | -------------------------------------------------------------- |
-| **Left**         | GPIO 0       | Hold to send Space (Claude Code voice-mode push-to-talk)       |
-| **Middle** (PWR) | AXP2101 PKEY | Cycle screens (Usage ↔ Bluetooth); on splash, cycle animations |
-| **Right**        | GPIO 18      | Press to send Shift+Tab (Claude Code mode toggle)              |
-
-Space and Shift+Tab go out as standard BLE HID keyboard reports, so they trigger in whatever window has focus on the paired host — not just Claude Code.
+To keep it running, register it as a scheduled task that runs at logon.
 
 ## BLE protocol
 
-The device advertises a custom GATT service alongside the standard HID keyboard service:
+The device advertises as **`Claude Controller`** with a custom GATT data service
+alongside the standard HID keyboard service (`0x1812`). The HID service is only
+there so desktop Bluetooth UIs surface a *Connect* button — this board sends no
+keystrokes.
 
-|                            | UUID                                   |
-| -------------------------- | -------------------------------------- |
-| **Data Service**           | `4c41555a-4465-7669-6365-000000000001` |
-| RX Characteristic (write)  | `4c41555a-4465-7669-6365-000000000002` |
-| TX Characteristic (notify) | `4c41555a-4465-7669-6365-000000000003` |
-| **HID Service**            | `00001812-0000-1000-8000-00805f9b34fb` |
+|                             | UUID                                   |
+| --------------------------- | -------------------------------------- |
+| **Data service**            | `4c41555a-4465-7669-6365-000000000001` |
+| RX — host writes payloads   | `4c41555a-4465-7669-6365-000000000002` |
+| TX — device ack/nack notify | `4c41555a-4465-7669-6365-000000000003` |
+| REQ — device refresh request | `4c41555a-4465-7669-6365-000000000004` |
 
-JSON payload format (written to RX):
+Payloads are compact JSON written to RX, routed by a `src` field (default
+`claude`):
+
+| `src`     | Fields                                                                 |
+| --------- | --------------------------------------------------------------------- |
+| `claude`  | `s` session %, `sr` session reset (min), `w` weekly %, `wr` weekly reset (min), `st` status, `ok` |
+| `copilot` | `pp` premium % used, `pr` remaining, `pe` entitlement, `prm` reset (min), `prd` reset date, `plan`, `en` |
+| `sysinfo` | `cpu` %, `ct` °C, `rp` RAM %, `ru`/`rt` RAM GB, `dp` disk %, `du`/`dt` disk GB |
+| `vscode`  | `mm` RSS MB, `vc` CPU %, `xe` ext-host count, `ec` error count, `le` last error |
+| `env`     | `ts` unix epoch, `tz` UTC offset (min), `tp` temp °C, `tc` WMO code, `th`/`tl` today hi/lo, `tn` location |
+| `act`     | `st` — `idle` / `working` / `needs_input` / `done`; `n` concurrent sessions; `age` secs |
+| `ci`      | `state` `pass`/`fail`/`running`/`none`; `wf` workflow, `br` branch, `age` min; `rev`/`chg` review counts; `dty`/`ah`/`bh`/`cf` git |
+| `sum`     | `am` active min, `tk` k-tokens, `usd` cost est, `cm` commits, `cp` Copilot used (today) |
+| `claude`  | (also) `mdl` model short name, `ctx` context-window % |
+| `status`  | `state` — `ok`, `no_token`, `api_error`                              |
 
 ```json
 { "s": 45, "sr": 120, "w": 28, "wr": 7200, "st": "allowed", "ok": true }
 ```
 
-Fields: `s` = session %, `sr` = session reset (minutes), `w` = weekly %, `wr` = weekly reset (minutes), `st` = status, `ok` = success flag.
+On boot with no data yet, the device notifies `0x01` on REQ when the daemon
+subscribes, so the first payload arrives without waiting for the poll interval.
 
-## Recompiling fonts
+## Rebuilding fonts and icons
 
-The `firmware/src/font_*.c` files are pre-compiled LVGL bitmap fonts.
-
-```bash
-npm install -g lv_font_conv
-```
-
-Generate each one (one at a time — `lv_font_conv` doesn't like loop-driven invocations) with `--no-compress` (required for LVGL 9):
-
-```bash
-# Tiempos Text (titles, 56px)
-lv_font_conv --font assets/TiemposText-400-Regular.otf -r 0x20-0x7E \
-  --size 56 --format lvgl --bpp 4 --no-compress \
-  -o firmware/src/font_tiempos_56.c --lv-include "lvgl.h"
-
-# Styrene B (large numbers 48, panel labels 28, small text 24, minimal 20)
-for size in 48 28 24 20; do
-  lv_font_conv --font assets/StyreneB-Regular.otf -r 0x20-0x7E \
-    --size $size --format lvgl --bpp 4 --no-compress \
-    -o firmware/src/font_styrene_${size}.c --lv-include "lvgl.h"
-done
-
-# DejaVu Sans Mono (32px, with spinner Unicode chars)
-lv_font_conv --font assets/DejaVuSansMono.ttf \
-  -r 0x20-0x7E,0xB7,0x2026,0x2722,0x2733,0x2736,0x273B,0x273D \
-  --size 32 --format lvgl --bpp 4 --no-compress \
-  -o firmware/src/font_mono_32.c --lv-include "lvgl.h"
-```
-
-**Important:** `lv_font_conv` v1.5.3 outputs LVGL 8 format. Each generated file must be patched for LVGL 9 compatibility:
-
-1. Remove `#if LVGL_VERSION_MAJOR >= 8` guards around `font_dsc` and the font struct
-2. Remove the `.cache` field from `font_dsc`
-3. Add `.release_glyph = NULL`, `.kerning = 0`, `.static_bitmap = 0` to the font struct
-4. Add `.fallback = NULL`, `.user_data = NULL` to the font struct
-
-Without these patches, fonts compile but render as invisible.
-
-## Converting Lucide icons
-
-The UI uses a small set of [Lucide](https://lucide.dev) icons (bluetooth + battery states) converted to RGB565 / RGB565A8 C arrays for LVGL.
-
-```bash
-node tools/png_to_lvgl.js assets/icon_bluetooth_48.png icon_bluetooth_data ICON_BLUETOOTH_WIDTH ICON_BLUETOOTH_HEIGHT
-```
-
-Default tint is white (`0xFFFFFF`); Lucide PNGs ship as black-on-transparent and would render invisible against the dark UI without it. Pass `--no-tint` for pre-coloured artwork like the logo. Battery icons use RGB565A8 (alpha plane) so they blend cleanly over the splash; the rest are baked RGB565 over the panel colour. Paste the converter output into `firmware/src/icons.h`.
+The `firmware/src/font_*.c` files are pre-compiled LVGL 9 bitmap fonts and
+`icons.h` holds RGB565 icon arrays. Regeneration steps (lv_font_conv, the LVGL 9
+patching it needs, and `tools/png_to_lvgl.js`) are documented in
+[`CLAUDE.md`](CLAUDE.md) and [`tools/README.md`](tools/README.md).
 
 ## Splash animations
 
-The animations come from [claudepix.vercel.app](https://claudepix.vercel.app),
-a library of Clawd sprites. `tools/scrape_claudepix.js` evaluates the
-site's JavaScript in a Node VM to pull out frame data and palettes, then
-`tools/convert_to_c.js` turns everything into RGB565 C arrays and writes
-`firmware/src/splash_animations.h`.
-
-To re-pull (e.g. when the source library updates):
+15 × 20×20 pixel-art animations — 13 scraped from
+[claudepix.vercel.app](https://claudepix.vercel.app), 2 hand-authored Copilot
+mascot loops. Pipeline:
 
 ```bash
-node tools/scrape_claudepix.js
-node tools/convert_to_c.js
-pio run -d firmware -t upload
+node tools/scrape_claudepix.js   # → tools/claudepix_data/*.json
+node tools/convert_to_c.js       # → firmware/src/splash_animations.h
 ```
 
-See `tools/README.md` for details.
+Don't hand-edit `splash_animations.h` — regenerate it.
 
 ## Credits
 
-- Pixel-art Clawd animation by [@amaanbuilds](https://x.com/amaanbuilds), sourced from [claudepix.vercel.app](https://claudepix.vercel.app). Frame data and palettes scraped + converted by the tooling in `tools/`.
-- Lucide icon set ([lucide.dev](https://lucide.dev), MIT) for bluetooth and battery UI glyphs.
-- Anthropic brand fonts (Tiempos Text, Styrene B) — see licensing warning below.
+- Pixel-art Clawd animation by [@amaanbuilds](https://x.com/amaanbuilds), sourced from [claudepix.vercel.app](https://claudepix.vercel.app).
+- Original project and Waveshare build by [@hermannbjorgvin](https://github.com/hermannbjorgvin).
+- macOS host port by [@lorddavidson](https://github.com/lorddavidson).
+- Lucide icon set ([lucide.dev](https://lucide.dev), MIT) for the bluetooth and battery glyphs.
+- Anthropic brand fonts (Tiempos Text, Styrene B) — see the licensing note below.
 
 ## Licensing gray area warning
 

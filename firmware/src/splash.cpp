@@ -27,6 +27,7 @@ static uint16_t cur_frame = 0;
 static uint32_t frame_started_ms = 0;
 static uint32_t last_pick_ms = 0;
 static bool active = false;
+static int  activity_group = -1;  // Claude-activity override; -1 = use usage rate
 
 // While splash is showing, auto-cycle to the next animation in the current
 // rate-driven group every this many ms.
@@ -229,9 +230,15 @@ void splash_next(void) {
     Serial.printf("splash: -> %s\n", a->name);
 }
 
+void splash_set_activity(int group) {
+    if (group == activity_group) return;
+    activity_group = (group >= 0 && group < GROUP_COUNT) ? group : -1;
+    if (active) splash_pick_for_current_rate();
+}
+
 void splash_pick_for_current_rate(void) {
     if (SPLASH_ANIM_COUNT == 0) return;
-    int g = usage_rate_group();
+    int g = (activity_group >= 0) ? activity_group : usage_rate_group();
     if (g < 0 || g >= GROUP_COUNT) g = 0;
     if (group_size[g] == 0) return;
 

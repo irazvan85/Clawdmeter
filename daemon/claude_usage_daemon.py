@@ -31,7 +31,18 @@ POLL_INTERVAL = 60
 COPILOT_POLL_INTERVAL = 300  # 5 minutes
 SYSINFO_POLL_INTERVAL = 30   # 30 seconds
 VSCODE_POLL_INTERVAL = 30    # 30 seconds
+ENV_POLL_INTERVAL = 900      # 15 minutes (clock + weather)
+ACT_POLL_INTERVAL = 5        # Claude activity — needs to feel responsive
+CI_POLL_INTERVAL = 120       # 2 minutes (CI status + review queue + git)
+SUM_POLL_INTERVAL = 300      # 5 minutes (daily summary)
 TICK = 5
+
+# Approx first-party token rates, $/1M (input, output). Cache reads ~= 0.1x in.
+MODEL_RATES = {
+    "opus": (5.0, 25.0), "sonnet": (3.0, 15.0), "haiku": (1.0, 5.0),
+    "fable": (10.0, 50.0),
+}
+CLAUDE_CTX_WINDOW = 200_000  # Claude Code default working window
 SCAN_TIMEOUT = 8.0
 
 # macOS: token lives in Keychain (service "Claude Code-credentials").
@@ -41,6 +52,10 @@ DEFAULT_CONFIG_DIR = Path.home() / ".claude"
 CREDENTIALS_PATH = DEFAULT_CONFIG_DIR / ".credentials.json"
 CONFIG_FILE = Path.home() / ".config" / "claude-usage-monitor" / "config"
 SAVED_ADDR_FILE = Path.home() / ".config" / "claude-usage-monitor" / "ble-address"
+LAST_PAYLOAD_FILE = Path.home() / ".config" / "claude-usage-monitor" / "last-payloads.json"
+GEO_CACHE_FILE = Path.home() / ".config" / "claude-usage-monitor" / "location.json"
+ACTIVITY_LOG = Path.home() / ".config" / "claude-usage-monitor" / "activity.log"
+CLAUDE_PROJECTS_DIR = Path.home() / ".claude" / "projects"
 TOKEN_ENV_VARS = (
     "CLAUDE_CODE_OAUTH_TOKEN",
     "ANTHROPIC_AUTH_TOKEN",
@@ -328,6 +343,405 @@ def poll_vscode() -> dict:
     return result
 
 
+# Fallback when the config names no location and none is cached.
+DEFAULT_LOCATION = (45.7489, 21.2087, "Timisoara")  # Timisoara, Romania
+
+
+def _ascii(s: str) -> str:
+    """The device fonts are ASCII-only — fold diacritics away before sending."""
+    return s.encode("ascii", "ignore").decode()
+
+
+async def _geocode(name: str) -> tuple[float, float, str] | None:
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as http:
+            resp = await http.get(
+                "https://geocoding-api.open-meteo.com/v1/search",
+                params={"name": name, "count": 1},
+            )
+        results = (resp.json() or {}).get("results") or []
+        if results:
+            r = results[0]
+            return (float(r["latitude"]), float(r["longitude"]), r.get("name") or name)
+    except (httpx.HTTPError, KeyError, ValueError) as e:
+        log(f"Geocoding '{name}' failed: {e}")
+    return None
+
+
+async def _resolve_location() -> tuple[float, float, str]:
+    """(lat, lon, label). Configurable in ~/.config/claude-usage-monitor/config:
+
+        location = Berlin          # city name, geocoded (result cached)
+        lat = 48.85 / lon = 2.35   # or explicit coordinates (win over `location`)
+
+    Defaults to Timisoara, Romania.
+    """
+    cfg = read_config()
+
+    try:
+        if cfg.get("lat") and cfg.get("lon"):
+            return (float(cfg["lat"]), float(cfg["lon"]),
+                    cfg.get("location") or "Home")
+    except (TypeError, ValueError):
+        log("Config lat/lon malformed; ignoring")
+
+    name = cfg.get("location", "").strip()
+    if not name:
+        return DEFAULT_LOCATION
+
+    try:
+        c = json.loads(GEO_CACHE_FILE.read_text(encoding="utf-8"))
+        if c.get("query") == name.lower():
+            return (float(c["lat"]), float(c["lon"]), c.get("label") or name)
+    except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+        pass
+
+    hit = await _geocode(name)
+    if hit is None:
+        log(f"Could not geocode '{name}'; using default location")
+        return DEFAULT_LOCATION
+
+    try:
+        GEO_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        GEO_CACHE_FILE.write_text(json.dumps(
+            {"query": name.lower(), "lat": hit[0], "lon": hit[1], "label": hit[2]}),
+            encoding="utf-8")
+    except OSError:
+        pass
+    return hit
+
+
+async def poll_env() -> dict:
+    """Clock + local weather for the device's Clock screen (src='env').
+
+    Time is always included; weather is best-effort (open-meteo, keyless).
+    """
+    now = datetime.now().astimezone()
+    result: dict = {
+        "src": "env",
+        "ts": int(time.time()),
+        "tz": int(now.utcoffset().total_seconds() // 60) if now.utcoffset() else 0,
+    }
+
+    lat, lon, city = await _resolve_location()
+    city = _ascii(city)[:15] or "Weather"
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as http:
+            resp = await http.get(
+                "https://api.open-meteo.com/v1/forecast",
+                params={
+                    "latitude": round(lat, 3), "longitude": round(lon, 3),
+                    "current": "temperature_2m,weather_code",
+                    "daily": "temperature_2m_max,temperature_2m_min",
+                    "forecast_days": 1, "timezone": "auto",
+                },
+            )
+        d = resp.json()
+        cur = d.get("current") or {}
+        daily = d.get("daily") or {}
+        result["tp"] = round(cur.get("temperature_2m", 0))
+        result["tc"] = int(cur.get("weather_code", 0))
+        result["th"] = round((daily.get("temperature_2m_max") or [0])[0])
+        result["tl"] = round((daily.get("temperature_2m_min") or [0])[0])
+        result["tn"] = city
+        log(f"Env: {city} {result['tp']}C code={result['tc']} "
+            f"H{result['th']} L{result['tl']}")
+    except (httpx.HTTPError, KeyError, ValueError, IndexError) as e:
+        log(f"Weather fetch failed: {e}")
+        result["tn"] = city
+    return result
+
+
+def _read_activity_lines() -> list[tuple[int, str, str]]:
+    try:
+        raw = ACTIVITY_LOG.read_text(encoding="utf-8", errors="ignore").splitlines()[-80:]
+    except OSError:
+        return []
+    out: list[tuple[int, str, str]] = []
+    for line in raw:
+        p = line.split("\t")
+        if len(p) >= 3:
+            try:
+                out.append((int(p[0]), p[1], p[2]))
+            except ValueError:
+                continue
+    return out
+
+
+def _activity_from_transcripts(now: float) -> dict:
+    """Fallback signal when the Claude Code hooks aren't installed: transcript
+    file mtimes. Coarser (no 'needs input') but zero setup."""
+    try:
+        mtimes = sorted((f.stat().st_mtime for f in CLAUDE_PROJECTS_DIR.rglob("*.jsonl")),
+                        reverse=True)
+    except OSError:
+        mtimes = []
+    if not mtimes:
+        return {"src": "act", "st": "idle", "n": 0, "age": -1}
+    age = int(now - mtimes[0])
+    agents = sum(1 for m in mtimes if now - m < 900)
+    st = "working" if age < 25 else "done" if age < 150 else "idle"
+    return {"src": "act", "st": st, "n": agents, "age": age}
+
+
+def poll_activity() -> dict:
+    """Claude Code activity for the device: working / idle / needs_input / done.
+
+    Primary source is the hook log (install_hooks.py); falls back to transcript
+    mtimes. Returns a src='act' payload.
+    """
+    now = time.time()
+    lines = _read_activity_lines()
+    if not lines:
+        return _activity_from_transcripts(now)
+
+    latest: dict[str, tuple[int, str]] = {}
+    for ts, event, sid in lines:
+        if sid not in latest or ts >= latest[sid][0]:
+            latest[sid] = (ts, event)
+
+    active = {s: v for s, v in latest.items() if now - v[0] < 900}
+    agents = len(active)
+    newest_ts = max((v[0] for v in latest.values()), default=0)
+    age = int(now - newest_ts) if newest_ts else -1
+
+    if any(ev == "Notification" and now - ts < 600 for ts, ev in active.values()):
+        st = "needs_input"
+    elif any(ev in ("UserPromptSubmit", "PreToolUse", "PostToolUse")
+             for _ts, ev in active.values()):
+        st = "working"
+    elif any(ev in ("Stop", "SubagentStop") and now - ts < 120
+             for ts, ev in latest.values()):
+        st = "done"
+    else:
+        st = "idle"
+
+    return {"src": "act", "st": st, "n": agents, "age": age}
+
+
+def _run(args: list[str], cwd: Path | None = None, timeout: float = 10.0) -> str | None:
+    try:
+        r = subprocess.run(args, cwd=str(cwd) if cwd else None, capture_output=True,
+                           text=True, timeout=timeout)
+        return r.stdout.strip() if r.returncode == 0 else None
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        return None
+
+
+def _active_repo() -> Path | None:
+    """The repo the developer is currently in: newest ~/.claude/ide/*.lock
+    workspace, else the newest transcript's cwd."""
+    ide = Path.home() / ".claude" / "ide"
+    try:
+        locks = sorted(ide.glob("*.lock"), key=lambda p: p.stat().st_mtime, reverse=True)
+    except OSError:
+        locks = []
+    for lk in locks:
+        try:
+            wf = (json.loads(lk.read_text(encoding="utf-8")).get("workspaceFolders") or [])
+            if wf and Path(wf[0]).exists():
+                return Path(wf[0])
+        except (OSError, json.JSONDecodeError, IndexError, TypeError):
+            continue
+    try:
+        files = sorted(CLAUDE_PROJECTS_DIR.rglob("*.jsonl"),
+                       key=lambda p: p.stat().st_mtime, reverse=True)[:3]
+    except OSError:
+        files = []
+    for f in files:
+        for line in reversed(f.read_text(encoding="utf-8", errors="ignore").splitlines()[-50:]):
+            try:
+                cwd = json.loads(line).get("cwd")
+            except (json.JSONDecodeError, ValueError):
+                continue
+            if cwd and Path(cwd).exists():
+                return Path(cwd)
+    return None
+
+
+def _newest_transcript() -> Path | None:
+    try:
+        files = sorted(CLAUDE_PROJECTS_DIR.rglob("*.jsonl"),
+                       key=lambda p: p.stat().st_mtime, reverse=True)
+        return files[0] if files else None
+    except OSError:
+        return None
+
+
+def _model_short(model: str) -> str:
+    m = (model or "").lower()
+    for key in ("opus", "sonnet", "haiku", "fable", "mythos"):
+        if key in m:
+            return key.capitalize()
+    return ""
+
+
+def active_session_model_ctx() -> tuple[str, int]:
+    """(short model name, context-window % used) from the newest transcript's
+    last assistant message. ('', -1) when unavailable."""
+    f = _newest_transcript()
+    if not f:
+        return ("", -1)
+    try:
+        lines = f.read_text(encoding="utf-8", errors="ignore").splitlines()[-60:]
+    except OSError:
+        return ("", -1)
+    for line in reversed(lines):
+        try:
+            j = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        msg = j.get("message") or {}
+        if j.get("type") == "assistant" and msg.get("usage"):
+            u = msg["usage"]
+            ctx = (u.get("input_tokens", 0) + u.get("cache_read_input_tokens", 0)
+                   + u.get("cache_creation_input_tokens", 0))
+            pct = min(100, round(100 * ctx / CLAUDE_CTX_WINDOW)) if ctx else -1
+            return (_model_short(msg.get("model", "")), pct)
+    return ("", -1)
+
+
+def poll_ci() -> dict | None:
+    """CI run status + review queue + working tree for the active repo."""
+    repo = _active_repo()
+    if repo is None:
+        return None
+    result: dict = {"src": "ci", "state": "none", "wf": "", "br": "",
+                    "age": -1, "rev": 0, "chg": 0, "dty": -1, "ah": 0, "bh": 0, "cf": False}
+
+    # --- git working tree ---
+    porc = _run(["git", "status", "--porcelain=v2", "--branch"], cwd=repo, timeout=6)
+    if porc is not None:
+        dirty = conflict = 0
+        for ln in porc.splitlines():
+            if ln.startswith("# branch.head "):
+                result["br"] = ln.split(" ", 2)[2]
+            elif ln.startswith("# branch.ab "):
+                parts = ln.split()
+                try:
+                    result["ah"], result["bh"] = int(parts[2]), -int(parts[3])
+                except (IndexError, ValueError):
+                    pass
+            elif ln and ln[0] in "12u":
+                dirty += 1
+                if ln[0] == "u":
+                    conflict += 1
+        result["dty"] = dirty
+        result["cf"] = conflict > 0
+
+    # --- GitHub CI + PRs (needs gh + a GitHub remote) ---
+    runs = _run(["gh", "run", "list", "-L", "1", "--json",
+                 "status,conclusion,workflowName,startedAt"], cwd=repo, timeout=12)
+    if runs:
+        try:
+            arr = json.loads(runs)
+            if arr:
+                r = arr[0]
+                if r.get("status") != "completed":
+                    result["state"] = "running"
+                elif r.get("conclusion") == "success":
+                    result["state"] = "pass"
+                else:
+                    result["state"] = "fail"
+                result["wf"] = (r.get("workflowName") or "")[:18]
+                started = r.get("startedAt") or ""
+                if started:
+                    dt = datetime.fromisoformat(started.replace("Z", "+00:00"))
+                    result["age"] = max(0, int((datetime.now(timezone.utc) - dt).total_seconds() / 60))
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+    mine = _run(["gh", "pr", "list", "--author", "@me", "--state", "open", "--json",
+                 "reviewDecision,statusCheckRollup"], cwd=repo, timeout=12)
+    if mine:
+        try:
+            for pr in json.loads(mine):
+                rollup = pr.get("statusCheckRollup") or []
+                failing = any(c.get("conclusion") in ("FAILURE", "TIMED_OUT", "CANCELLED")
+                              for c in rollup)
+                if failing or pr.get("reviewDecision") == "CHANGES_REQUESTED":
+                    result["chg"] += 1
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+    tor = _run(["gh", "search", "prs", "--review-requested=@me", "--state=open",
+                "-L", "40", "--json", "url"], timeout=12)
+    if tor:
+        try:
+            result["rev"] = len(json.loads(tor))
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+    log(f"CI: {result['state']} {result['wf']} br={result['br']} "
+        f"review={result['rev']} changes={result['chg']} dirty={result['dty']}")
+    return result
+
+
+def poll_summary() -> dict:
+    """Today's totals from the transcripts + git, since local midnight."""
+    now = datetime.now().astimezone()
+    midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    mid_ts = midnight.timestamp()
+
+    minute_buckets: set[int] = set()
+    tok = 0
+    cost = 0.0
+    try:
+        files = list(CLAUDE_PROJECTS_DIR.rglob("*.jsonl"))
+    except OSError:
+        files = []
+    for f in files:
+        try:
+            if f.stat().st_mtime < mid_ts:
+                continue
+            lines = f.read_text(encoding="utf-8", errors="ignore").splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            try:
+                j = json.loads(line)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            ts = j.get("timestamp", "")
+            if not ts:
+                continue
+            try:
+                t = datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+            except ValueError:
+                continue
+            if t < mid_ts:
+                continue
+            minute_buckets.add(int(t // 60))
+            msg = j.get("message") or {}
+            if j.get("type") == "assistant" and msg.get("usage"):
+                u = msg["usage"]
+                inp = u.get("input_tokens", 0) + u.get("cache_creation_input_tokens", 0)
+                cr = u.get("cache_read_input_tokens", 0)
+                out = u.get("output_tokens", 0)
+                tok += inp + out   # fresh work; cache reads re-send the same tokens
+                ri, ro = MODEL_RATES.get(_model_short(msg.get("model", "")).lower(), (0, 0))
+                cost += (inp * ri + cr * ri * 0.1 + out * ro) / 1_000_000
+
+    act_min = len(minute_buckets)
+    commits = 0
+    repo = _active_repo()
+    if repo is not None:
+        email = _run(["git", "config", "user.email"], cwd=repo, timeout=5) or ""
+        out = _run(["git", "log", "--since", midnight.strftime("%Y-%m-%dT%H:%M:%S"),
+                    f"--author={email}", "--oneline"], cwd=repo, timeout=8)
+        if out is not None:
+            commits = len([l for l in out.splitlines() if l.strip()])
+
+    cp_used = -1
+    cp = _last_payloads.get("copilot")
+    if cp and cp.get("pe", -1) > 0 and cp.get("pr", -1) >= 0:
+        cp_used = cp["pe"] - cp["pr"]
+
+    result = {"src": "sum", "am": act_min, "tk": tok // 1000,
+              "usd": round(cost), "cm": commits, "cp": cp_used}
+    log(f"Summary: {act_min}min {tok // 1000}k ${round(cost)} {commits}commits cp={cp_used}")
+    return result
+
 
 def _extract_access_token(blob: str) -> str | None:
     """Pull the accessToken out of a credentials blob.
@@ -402,12 +816,9 @@ def _read_token_keychain() -> str | None:
     return _extract_access_token(out.stdout)
 
 
-def read_config_dirs() -> list[Path]:
-    """Claude config dirs from config_dirs in daemon config (comma-separated).
-
-    Defaults to [~/.claude] when unset.
-    """
-    raw = ""
+def read_config() -> dict[str, str]:
+    """All `key = value` pairs from the daemon config file (lowercased keys)."""
+    cfg: dict[str, str] = {}
     try:
         if CONFIG_FILE.exists():
             for line in CONFIG_FILE.read_text(encoding="utf-8").splitlines():
@@ -415,10 +826,18 @@ def read_config_dirs() -> list[Path]:
                 if "=" not in line:
                     continue
                 key, val = line.split("=", 1)
-                if key.strip().lower() == "config_dirs":
-                    raw = val.strip()
+                cfg[key.strip().lower()] = val.strip()
     except OSError:
         pass
+    return cfg
+
+
+def read_config_dirs() -> list[Path]:
+    """Claude config dirs from config_dirs in daemon config (comma-separated).
+
+    Defaults to [~/.claude] when unset.
+    """
+    raw = read_config().get("config_dirs", "")
 
     if not raw:
         return [DEFAULT_CONFIG_DIR]
@@ -494,6 +913,21 @@ async def poll_active_payload() -> dict | None:
     return None
 
 
+def have_any_token() -> bool:
+    """True if a Claude token is resolvable from any configured source."""
+    if _read_token_env():
+        return True
+    for cfg_dir in read_config_dirs():
+        if read_token_for(cfg_dir):
+            return True
+    return False
+
+
+def status_payload(state: str) -> dict:
+    """A lightweight frame so the device can show *why* usage stopped updating."""
+    return {"src": "status", "state": state}
+
+
 def load_cached_address() -> str | None:
     if not SAVED_ADDR_FILE.exists():
         return None
@@ -512,6 +946,33 @@ def load_cached_address() -> str | None:
 def save_address(addr: str) -> None:
     SAVED_ADDR_FILE.parent.mkdir(parents=True, exist_ok=True)
     SAVED_ADDR_FILE.write_text(addr)
+
+
+# Last successfully-sent payload per `src`, so a display that reconnects after a
+# daemon restart isn't stuck on stale numbers until the next poll cycle.
+_last_payloads: dict[str, dict] = {}
+
+
+def load_last_payloads() -> None:
+    global _last_payloads
+    try:
+        data = json.loads(LAST_PAYLOAD_FILE.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            _last_payloads = {k: v for k, v in data.items() if isinstance(v, dict)}
+    except (OSError, json.JSONDecodeError):
+        _last_payloads = {}
+
+
+def remember_payload(payload: dict) -> None:
+    src = payload.get("src", "claude")
+    if src in ("status", "act"):
+        return  # transient, not worth replaying
+    _last_payloads[src] = payload
+    try:
+        LAST_PAYLOAD_FILE.parent.mkdir(parents=True, exist_ok=True)
+        LAST_PAYLOAD_FILE.write_text(json.dumps(_last_payloads), encoding="utf-8")
+    except OSError:
+        pass
 
 
 async def scan_for_device() -> str | None:
@@ -572,6 +1033,11 @@ async def poll_api(token: str) -> dict | None:
         "st": hdr("anthropic-ratelimit-unified-5h-status", "unknown"),
         "ok": resp.status_code < 400,
     }
+    mdl, ctx = active_session_model_ctx()
+    if mdl:
+        payload["mdl"] = mdl
+    if ctx >= 0:
+        payload["ctx"] = ctx
     return payload
 
 
@@ -601,10 +1067,17 @@ class Session:
 
         try:
             await self.client.write_gatt_char(RX_CHAR_UUID, data, response=False)
+            remember_payload(payload)
             return True
         except BleakError as e:
             log(f"Write failed: {e}")
             return False
+
+    async def replay_last_payloads(self) -> None:
+        """Re-send the last known values so a fresh reconnect isn't blank."""
+        for src, payload in list(_last_payloads.items()):
+            if await self.write_payload(payload):
+                log(f"Replayed cached {src} payload")
 
 
 async def connect_and_run(address: str, stop_event: asyncio.Event) -> bool:
@@ -629,11 +1102,18 @@ async def connect_and_run(address: str, stop_event: asyncio.Event) -> bool:
     log("Connected")
     session = Session(client)
     await session.setup_refresh_subscription()
+    await session.replay_last_payloads()
 
     last_poll = 0.0
     last_copilot_poll = 0.0
     last_sysinfo_poll = 0.0
     last_vscode_poll = 0.0
+    last_env_poll = 0.0
+    last_act_poll = 0.0
+    last_act_state: str | None = None
+    last_act_sent = 0.0
+    last_ci_poll = 0.0
+    last_sum_poll = 0.0
     used_successfully = False
 
     # Warm up cpu_percent so the first non-blocking call returns a real value
@@ -651,7 +1131,9 @@ async def connect_and_run(address: str, stop_event: asyncio.Event) -> bool:
                 session.refresh_requested.clear()
                 payload = await poll_active_payload()
                 if payload is None:
-                    log("No Claude payload; skipping poll")
+                    state = "no_token" if not have_any_token() else "api_error"
+                    log(f"No Claude payload; sending status={state}")
+                    await session.write_payload(status_payload(state))
                 elif await session.write_payload(payload):
                     last_poll = time.time()
                     used_successfully = True
@@ -686,6 +1168,37 @@ async def connect_and_run(address: str, stop_event: asyncio.Event) -> bool:
                 last_vscode_poll = now
                 vs_payload = poll_vscode()
                 await session.write_payload(vs_payload)
+
+            # Clock + weather every 15 minutes (also once, right after connect)
+            now = time.time()
+            if now - last_env_poll >= ENV_POLL_INTERVAL:
+                last_env_poll = now
+                await session.write_payload(await poll_env())
+
+            # Claude activity — check often, send on change or as a 60s keepalive
+            now = time.time()
+            if now - last_act_poll >= ACT_POLL_INTERVAL:
+                last_act_poll = now
+                act = poll_activity()
+                if act["st"] != last_act_state or now - last_act_sent >= 60:
+                    if act["st"] != last_act_state:
+                        log(f"Activity: {act['st']} (agents={act['n']})")
+                    last_act_state, last_act_sent = act["st"], now
+                    await session.write_payload(act)
+
+            # CI status + review queue + git — every 2 min
+            now = time.time()
+            if now - last_ci_poll >= CI_POLL_INTERVAL:
+                last_ci_poll = now
+                ci = await asyncio.to_thread(poll_ci)
+                if ci is not None:
+                    await session.write_payload(ci)
+
+            # Daily summary — every 5 min
+            now = time.time()
+            if now - last_sum_poll >= SUM_POLL_INTERVAL:
+                last_sum_poll = now
+                await session.write_payload(await asyncio.to_thread(poll_summary))
     finally:
         try:
             await client.disconnect()
@@ -712,6 +1225,7 @@ async def main() -> None:
 
     log("=== Claude Usage Tracker Daemon (BLE) ===")
     log(f"Poll interval: {POLL_INTERVAL}s")
+    load_last_payloads()
 
     backoff = 1
     while not stop_event.is_set():
