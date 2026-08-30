@@ -10,3 +10,7 @@ void usage_rate_sample(float session_pct);
 // 0 = idle, 1 = normal, 2 = active, 3 = heavy.
 // Defaults to 0 when the buffer doesn't have enough samples yet.
 int usage_rate_group(void);
+
+// Smoothed rate of session_pct increase in %/min over the sample window, or
+// -1.0 when there isn't enough history yet (same warm-up as usage_rate_group).
+float usage_rate_per_min(void);

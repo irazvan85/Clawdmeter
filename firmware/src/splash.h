@@ -21,6 +21,10 @@ void splash_hide(void);
 // trigger a re-pick when the rate group changes mid-display.
 void splash_pick_for_current_rate(void);
 
+// Override the mood group from the Claude-activity signal (0..3), or -1 to
+// fall back to the usage-rate group. Re-picks immediately if the splash is up.
+void splash_set_activity(int group);
+
 // True when splash is currently rendering (used to gate re-picks).
 bool splash_is_active(void);
 
