@@ -78,6 +78,15 @@ API_BODY = {
     "messages": [{"role": "user", "content": "hi"}],
 }
 
+# Claude Code OAuth — used to refresh an expired access token ourselves rather
+# than waiting for `claude` to run. Public client id; UA must NOT be claude-code.
+OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+OAUTH_TOKEN_URLS = (
+    "https://console.anthropic.com/v1/oauth/token",
+    "https://platform.claude.com/v1/oauth/token",
+)
+_LAST_API_STATUS = 0   # HTTP status of the most recent poll_api() call
+
 
 _LOG_FILE: Path | None = None
 
@@ -877,6 +886,84 @@ def _read_token_env() -> str | None:
     return None
 
 
+def _find_oauth_node(data: object) -> dict | None:
+    """The dict holding the *Claude* accessToken + refreshToken. Skips the
+    per-server nodes under mcpOAuth (those have accessToken but no refreshToken)."""
+    if not isinstance(data, dict):
+        return None
+    n = data.get("claudeAiOauth")
+    if isinstance(n, dict) and n.get("refreshToken"):
+        return n
+    if data.get("refreshToken") and data.get("accessToken"):
+        return data
+    for v in data.values():
+        hit = _find_oauth_node(v)
+        if hit is not None:
+            return hit
+    return None
+
+
+async def refresh_oauth_token(config_dir: Path) -> str | None:
+    """Exchange the on-disk refresh token for a fresh access token and write the
+    rotated pair back to <config_dir>/.credentials.json. Returns the new access
+    token, or None if there's nothing to refresh / the exchange failed."""
+    cred_file = config_dir / ".credentials.json"
+    try:
+        blob = json.loads(cred_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    node = _find_oauth_node(blob)
+    if not node or not node.get("refreshToken"):
+        return None
+
+    body = {
+        "grant_type": "refresh_token",
+        "refresh_token": node["refreshToken"],
+        "client_id": OAUTH_CLIENT_ID,
+    }
+    tok = None
+    for url in OAUTH_TOKEN_URLS:
+        try:
+            async with httpx.AsyncClient(timeout=20.0) as http:
+                r = await http.post(url, json=body,
+                                    headers={"Content-Type": "application/json",
+                                             "User-Agent": "anthropic"})
+        except httpx.HTTPError as e:
+            log(f"Token refresh ({url}): {e}")
+            continue
+        if r.status_code == 404:
+            continue
+        if r.status_code != 200:
+            log(f"Token refresh HTTP {r.status_code}: {r.text[:160]}")
+            return None
+        tok = r.json()
+        break
+    if not tok or "access_token" not in tok:
+        return None
+
+    node["accessToken"] = tok["access_token"]
+    if tok.get("refresh_token"):
+        node["refreshToken"] = tok["refresh_token"]
+    if tok.get("expires_in"):
+        node["expiresAt"] = int(time.time() * 1000) + int(tok["expires_in"]) * 1000
+
+    try:
+        bak = cred_file.with_suffix(".json.bak")
+        if cred_file.exists() and not bak.exists():
+            bak.write_text(cred_file.read_text(encoding="utf-8"), encoding="utf-8")
+        tmp = cred_file.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(blob, indent=2), encoding="utf-8")
+        os.replace(tmp, cred_file)
+        try:
+            os.chmod(cred_file, 0o600)
+        except OSError:
+            pass
+        log("Refreshed the Claude OAuth token")
+    except OSError as e:
+        log(f"Token refresh: could not write credentials: {e}")
+    return tok["access_token"]
+
+
 def read_token_for(config_dir: Path) -> str | None:
     token = _read_token_env()
     if token:
@@ -915,7 +1002,11 @@ def read_token() -> str | None:
 
 
 async def poll_active_payload() -> dict | None:
-    """Poll configured Claude config dirs and return the first valid payload."""
+    """Poll configured Claude config dirs and return the first valid payload.
+
+    On a 401 from a file-based token, refresh it via the OAuth refresh token and
+    retry once — so usage keeps flowing even when `claude` hasn't run lately."""
+    env_token = _read_token_env()
     for cfg_dir in read_config_dirs():
         token = read_token_for(cfg_dir)
         if not token:
@@ -923,6 +1014,12 @@ async def poll_active_payload() -> dict | None:
         payload = await poll_api(token)
         if payload is not None:
             return payload
+        if _LAST_API_STATUS == 401 and not env_token:
+            new_token = await refresh_oauth_token(cfg_dir)
+            if new_token:
+                payload = await poll_api(new_token)
+                if payload is not None:
+                    return payload
     return None
 
 
@@ -999,6 +1096,8 @@ async def scan_for_device() -> str | None:
 
 
 async def poll_api(token: str) -> dict | None:
+    global _LAST_API_STATUS
+    _LAST_API_STATUS = 0
     headers = dict(API_HEADERS_TEMPLATE)
     headers["Authorization"] = f"Bearer {token}"
     try:
@@ -1007,6 +1106,7 @@ async def poll_api(token: str) -> dict | None:
     except httpx.HTTPError as e:
         log(f"API call failed: {e}")
         return None
+    _LAST_API_STATUS = resp.status_code
 
     def hdr(name: str, default: str = "0") -> str:
         return resp.headers.get(name, default)
@@ -1058,6 +1158,12 @@ class Session:
     def __init__(self, client: BleakClient) -> None:
         self.client = client
         self.refresh_requested = asyncio.Event()
+        self.write_fails = 0
+
+    def link_broken(self) -> bool:
+        """Connected but writes keep failing (missing RX characteristic / stale
+        GATT table) — only a fresh connect, or a device power-cycle, fixes it."""
+        return self.write_fails >= 4
 
     def _on_refresh(self, _char, _data: bytearray) -> None:
         log("Refresh requested by device")
@@ -1080,10 +1186,19 @@ class Session:
 
         try:
             await self.client.write_gatt_char(RX_CHAR_UUID, data, response=False)
+            self.write_fails = 0
             remember_payload(payload)
             return True
         except BleakError as e:
-            log(f"Write failed: {e}")
+            self.write_fails += 1
+            log(f"Write failed ({self.write_fails}): {e}")
+            if self.link_broken():
+                log("RX characteristic unreachable - dropping the link to "
+                    "reconnect. If this repeats, power-cycle the device.")
+                try:
+                    await self.client.disconnect()
+                except BleakError:
+                    pass
             return False
 
     async def replay_last_payloads(self) -> None:
@@ -1137,7 +1252,7 @@ async def connect_and_run(address: str, stop_event: asyncio.Event) -> bool:
         pass
 
     try:
-        while client.is_connected and not stop_event.is_set():
+        while client.is_connected and not stop_event.is_set() and not session.link_broken():
             now = time.time()
             elapsed = now - last_poll
             if session.refresh_requested.is_set() or elapsed >= POLL_INTERVAL:
