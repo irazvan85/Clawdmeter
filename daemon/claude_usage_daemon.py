@@ -79,8 +79,21 @@ API_BODY = {
 }
 
 
+_LOG_FILE: Path | None = None
+
+
 def log(msg: str) -> None:
-    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+    line = f"[{time.strftime('%H:%M:%S')}] {msg}"
+    print(line, flush=True)
+    if _LOG_FILE is not None:
+        try:
+            if _LOG_FILE.exists() and _LOG_FILE.stat().st_size > 1_000_000:
+                tail = _LOG_FILE.read_text(encoding="utf-8", errors="ignore").splitlines()[-2000:]
+                _LOG_FILE.write_text("\n".join(tail) + "\n", encoding="utf-8")
+            with open(_LOG_FILE, "a", encoding="utf-8") as f:
+                f.write(f"{time.strftime('%Y-%m-%d')} {line}\n")
+        except OSError:
+            pass
 
 
 def read_github_token() -> str | None:
@@ -1257,6 +1270,11 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
+    for i, a in enumerate(sys.argv[1:], 1):
+        if a in ("--log", "-l") and i < len(sys.argv) - 1:
+            _LOG_FILE = Path(sys.argv[i + 1]).expanduser()
+        elif a.startswith("--log="):
+            _LOG_FILE = Path(a.split("=", 1)[1]).expanduser()
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
