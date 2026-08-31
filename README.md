@@ -137,6 +137,11 @@ writes a JSON payload to the device over a GATT characteristic. It also tracks
 the rate of change of session % and the device uses that to pick a splash
 animation mood.
 
+If the access token has expired (device shows `API error`), the daemon refreshes
+it itself using the `refreshToken` in `~/.claude/.credentials.json` — writing the
+rotated pair back atomically, with a one-time `.credentials.json.bak` — so usage
+keeps flowing even when `claude` hasn't run in a while.
+
 - **`daemon/claude_usage_daemon.py`** (macOS, Windows, and Linux via BlueZ) — also
   polls GitHub Copilot premium-request quota, host CPU/RAM/disk, VS Code process
   stats, and the time + local weather for the Clock screen. It sends a `status`
