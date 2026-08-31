@@ -137,6 +137,11 @@ writes a JSON payload to the device over a GATT characteristic. It also tracks
 the rate of change of session % and the device uses that to pick a splash
 animation mood.
 
+If the access token has expired (device shows `API error`), the daemon refreshes
+it itself using the `refreshToken` in `~/.claude/.credentials.json` — writing the
+rotated pair back atomically, with a one-time `.credentials.json.bak` — so usage
+keeps flowing even when `claude` hasn't run in a while.
+
 - **`daemon/claude_usage_daemon.py`** (macOS, Windows, and Linux via BlueZ) — also
   polls GitHub Copilot premium-request quota, host CPU/RAM/disk, VS Code process
   stats, and the time + local weather for the Clock screen. It sends a `status`
@@ -192,15 +197,26 @@ Status: `systemctl --user status claude-usage-daemon` · Logs: `journalctl --use
 
 ### Windows
 
-Run the Python daemon directly (a venv with `bleak` + `httpx` + `psutil`; see
-`daemon/requirements.txt`). Pair "Claude Controller" once from **Settings →
-Bluetooth & devices**, then:
+Pair "Claude Controller" once from **Settings → Bluetooth & devices**, then run
+the installer — it creates `daemon\.venv` (`bleak` + `httpx` + `psutil`) and
+registers a **Scheduled Task** that starts the daemon at logon, hidden, with
+restart-on-failure:
 
 ```powershell
-python daemon\claude_usage_daemon.py
+powershell -ExecutionPolicy Bypass -File daemon\install-windows.ps1
 ```
 
-To keep it running, register it as a scheduled task that runs at logon.
+```powershell
+Get-ScheduledTask ClawdmeterDaemon | Get-ScheduledTaskInfo   # status
+Get-Content $env:LOCALAPPDATA\claude-usage-monitor\daemon.log -Tail 20 -Wait   # logs
+Stop-ScheduledTask ClawdmeterDaemon                          # stop
+powershell -File daemon\install-windows.ps1 -Uninstall       # remove
+```
+
+It's a per-user Scheduled Task, not a session-0 service: `bleak`'s WinRT
+Bluetooth backend only enumerates devices inside an interactive session, and the
+daemon needs your `~/.claude` credentials and `gh` login. To run it in the
+foreground for a quick test: `python daemon\claude_usage_daemon.py`.
 
 ## BLE protocol
 
