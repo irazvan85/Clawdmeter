@@ -192,15 +192,26 @@ Status: `systemctl --user status claude-usage-daemon` · Logs: `journalctl --use
 
 ### Windows
 
-Run the Python daemon directly (a venv with `bleak` + `httpx` + `psutil`; see
-`daemon/requirements.txt`). Pair "Claude Controller" once from **Settings →
-Bluetooth & devices**, then:
+Pair "Claude Controller" once from **Settings → Bluetooth & devices**, then run
+the installer — it creates `daemon\.venv` (`bleak` + `httpx` + `psutil`) and
+registers a **Scheduled Task** that starts the daemon at logon, hidden, with
+restart-on-failure:
 
 ```powershell
-python daemon\claude_usage_daemon.py
+powershell -ExecutionPolicy Bypass -File daemon\install-windows.ps1
 ```
 
-To keep it running, register it as a scheduled task that runs at logon.
+```powershell
+Get-ScheduledTask ClawdmeterDaemon | Get-ScheduledTaskInfo   # status
+Get-Content $env:LOCALAPPDATA\claude-usage-monitor\daemon.log -Tail 20 -Wait   # logs
+Stop-ScheduledTask ClawdmeterDaemon                          # stop
+powershell -File daemon\install-windows.ps1 -Uninstall       # remove
+```
+
+It's a per-user Scheduled Task, not a session-0 service: `bleak`'s WinRT
+Bluetooth backend only enumerates devices inside an interactive session, and the
+daemon needs your `~/.claude` credentials and `gh` login. To run it in the
+foreground for a quick test: `python daemon\claude_usage_daemon.py`.
 
 ## BLE protocol
 
