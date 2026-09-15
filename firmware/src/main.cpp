@@ -4,7 +4,6 @@
 #include "display_cfg.h"
 #include "data.h"
 #include "ui.h"
-#include "ble.h"
 #include "power.h"
 #include "imu.h"
 #include "env_sensor.h"
@@ -61,12 +60,14 @@ static uint32_t my_tick(void) {
 }
 
 // When true, my_flush_cb also captures each flushed tile — either streamed
-// over serial (shot_fb == nullptr, the QA `screenshot` command) or copied
-// into shot_fb (the HTTP screenshot endpoint, web_server.cpp). Either way no
-// full-frame buffer is kept permanently — heap is too fragmented on this
-// board for that; the caller mallocs a transient buffer only when needed.
-static volatile bool shot_active = false;
-static uint16_t*     shot_fb     = nullptr;
+// over serial (shot_cb == nullptr, the QA `screenshot` command) or handed to
+// shot_cb one tile at a time (GET /api/screenshot.bmp, web_server.cpp). No
+// full-frame buffer is ever kept or allocated for either sink — a single
+// ~65 KB malloc() used to be exactly what made the HTTP endpoint fail with
+// "out of memory" once WiFi + an active daemon connection were also holding
+// heap; both sinks now only ever touch one tile (a few KB) at a time.
+static volatile bool        shot_active = false;
+static screenshot_tile_cb   shot_cb     = nullptr;
 
 // LVGL flush callback — ST7789 direct SPI write, no rotation needed
 static void my_flush_cb(lv_display_t* disp, const lv_area_t* area, uint8_t* px_map) {
@@ -74,12 +75,8 @@ static void my_flush_cb(lv_display_t* disp, const lv_area_t* area, uint8_t* px_m
     int32_t h = area->y2 - area->y1 + 1;
     gfx->draw16bitRGBBitmap(area->x1, area->y1, (uint16_t*)px_map, w, h);
     if (shot_active) {
-        if (shot_fb) {
-            const uint16_t* src = (const uint16_t*)px_map;
-            for (int32_t row = 0; row < h; row++) {
-                memcpy(&shot_fb[(area->y1 + row) * LCD_WIDTH + area->x1],
-                       &src[row * w], (size_t)w * 2);
-            }
+        if (shot_cb) {
+            shot_cb(area->x1, area->y1, area->x2, area->y2, (const uint16_t*)px_map);
         } else {
             Serial.printf("A %ld %ld %ld %ld\n",
                 (long)area->x1, (long)area->y1, (long)area->x2, (long)area->y2);
@@ -95,19 +92,19 @@ static void my_flush_cb(lv_display_t* disp, const lv_area_t* area, uint8_t* px_m
 static void capture_screenshot(void) {
     shot_active = true;
     lv_obj_invalidate(lv_screen_active());
-    for (int i = 0; i < 30; i++) {   // ~1.5s ceiling; a full 135x240 redraw is a handful of tiles
+    for (int i = 0; i < 30; i++) {   // ~150ms ceiling; a full 135x240 redraw is a handful of tiles
         lv_timer_handler();
         delay(5);
     }
     shot_active = false;
 }
 
-// Capture the current LVGL frame into `out` (must hold LCD_WIDTH*LCD_HEIGHT
-// uint16_t RGB565 pixels). Declared in device_api.h for web_server.cpp.
-bool capture_screenshot_rgb565(uint16_t* out) {
-    shot_fb = out;
+// Capture the current LVGL frame, invoking `cb` once per flushed tile.
+// Declared in device_api.h for web_server.cpp.
+bool capture_screenshot_streamed(screenshot_tile_cb cb) {
+    shot_cb = cb;
     capture_screenshot();
-    shot_fb = nullptr;
+    shot_cb = nullptr;
     return true;
 }
 
@@ -130,8 +127,9 @@ static void send_screenshot() {
     Serial.println("SCREENSHOT_END");
 }
 
-// Parse one JSON payload (from BLE, or the `feed` serial command) and push it
-// into the UI. Routed by the "src" field; default is Claude usage.
+// Parse one JSON payload (from an HTTP POST to /api/payload, or the `feed`
+// serial command) and push it into the UI. Routed by the "src" field;
+// default is Claude usage.
 static bool process_payload(const char* raw) {
     JsonDocument doc;
     if (deserializeJson(doc, raw) != DeserializationError::Ok) {
@@ -322,11 +320,13 @@ void build_state_json(JsonDocument& doc) {
     today["valid"]       = todayd.valid;
 
     JsonObject conn = doc["connectivity"].to<JsonObject>();
-    conn["ble_state"]   = (int)ble_get_state();
-    conn["ble_device"]  = ble_get_device_name();
     conn["daemon_state"] = ui_get_daemon_state();
     conn["wifi_state"]  = (int)wifi_get_state();
     conn["wifi_ip"]     = wifi_get_ip();
+}
+
+bool device_ingest_payload(const char* raw) {
+    return process_payload(raw);
 }
 
 // ---- Backlight: steady / breathe-while-working / idle-dim ----
@@ -379,8 +379,16 @@ static void check_serial_cmd() {
                     Serial.printf("screen -> %d\n", n);
                 }
             } else if (strncmp(cmd_buf, "feed ", 5) == 0) {
-                // QA helper: inject a payload as if it arrived over BLE.
+                // QA helper: inject a payload as if it arrived over
+                // POST /api/payload. Also how WiFi gets provisioned:
+                // feed {"src":"wifi","ssid":"...","pass":"..."}
                 Serial.println(process_payload(cmd_buf + 5) ? "feed ok" : "feed err");
+            } else if (strcmp(cmd_buf, "token") == 0) {
+                // Prints the HTTP auth token (POST /api/payload's
+                // X-Auth-Token) without needing to read it off-screen --
+                // useful for scripted setup since it's generated once and
+                // persisted regardless of current WiFi state.
+                Serial.println(wifi_get_token());
             } else if (strcmp(cmd_buf, "timer") == 0) {
                 ui_timer_toggle();
                 Serial.println("timer toggled");
@@ -451,48 +459,43 @@ void setup() {
     lv_display_set_buffers(disp, buf1, buf2, LCD_WIDTH * BUF_LINES * 2,
                            LV_DISPLAY_RENDER_MODE_PARTIAL);
 
-    // Init BLE data channel
-    ble_init();
-
     // Physical button: back (GPIO 0 / BOOT button)
     pinMode(BTN_BACK, INPUT_PULLUP);
 
-    // Build dashboard — deliberately BEFORE wifi_init() below: this makes
-    // its one-time mallocs (LVGL partial buffers already done above, the
-    // ~29 KB splash canvas here) claim heap while it's most free. WiFi's
-    // own runtime buffers (~40-70 KB, allocated once WiFi.mode() actually
-    // runs — not visible in the static RAM% the build report prints) are
-    // the biggest heap consumer added by this feature; letting the UI go
-    // first avoids it starving the splash canvas malloc (which used to
-    // crash the device — see the null-guards in splash.cpp — when it lost
-    // that race).
-    ui_init();
+    // If WiFi credentials are already stored, prime the driver's one-time
+    // large heap allocation now, before ui_init()'s many small LVGL
+    // allocations fragment the heap (see wifi_net.cpp's wifi_init_early()
+    // for the measured numbers behind this — this is what CLAUDE.md gotcha
+    // #14 is about). No-op/zero-cost when no credentials are stored yet.
+    wifi_init_early();
 
-    // Show initial BLE status on Bluetooth screen
-    ui_update_ble_status(ble_get_state(), ble_get_device_name(), ble_get_mac_address());
+    // splash.cpp's shared canvas malloc (~29 KB) has null-guards (see
+    // get_shared_canvas_buf()) so a lost race against the WiFi priming
+    // above degrades to "no animation" rather than a crash.
+    ui_init();
 
     // Show initial battery status
     ui_update_battery(power_battery_pct(), power_is_charging());
 
     ui_show_screen(SCREEN_SPLASH);
 
-    // WiFi is additive to BLE, not a replacement — connects only if
-    // credentials were previously provisioned (over BLE, see process_payload's
-    // "wifi" case). web_server_init() only registers routes; it defers
-    // actually starting the listener until WiFi has a real IP (see its own
-    // comment in web_server.cpp for why that has to be deferred).
+    // WiFi is the sole transport now (see CLAUDE.md gotcha #14 for why BLE
+    // was removed) — connects only if credentials were previously
+    // provisioned (over serial, see process_payload's "wifi" case). Starts
+    // the actual connect attempt, reusing the driver wifi_init_early()
+    // primed above (before ui_init()) when possible. web_server_init()
+    // only registers routes; it defers actually starting the listener
+    // until WiFi has a real IP (see its own comment in web_server.cpp for
+    // why that has to be deferred).
     wifi_init();
     web_server_init();
 
-    Serial.println("Dashboard ready, waiting for data on BLE...");
+    Serial.println("Dashboard ready, waiting for data over WiFi or serial...");
 }
-
-static ble_state_t last_ble_state = BLE_STATE_INIT;
 
 void loop() {
     lv_timer_handler();
     ui_tick_anim();
-    ble_tick();
     wifi_tick();
     web_server_tick();
     power_tick();
@@ -505,7 +508,7 @@ void loop() {
 
     // Single button (GPIO 0 / BOOT) — the only input on this board (no touch):
     //   Short press       → next screen (Usage → Copilot → System → VS Code →
-    //                       Bluetooth → Splash → …; unpopulated screens skipped)
+    //                       Connectivity → Splash → …; unpopulated screens skipped)
     //   Quick double-press → jump straight to the Clock ("home") screen —
     //                       with up to 10 screens in the cycle, waiting on
     //                       every short press to see if a second one follows
@@ -513,8 +516,13 @@ void loop() {
     //                       the first press always cycles immediately and a
     //                       second one landing within DOUBLE_PRESS_MS just
     //                       redirects straight to Clock.
-    //   Long press        → Bluetooth screen: clear the BLE bond;
-    //                       any other screen: ask the daemon for a fresh poll
+    //   Long press        → Connectivity screen: forget the stored WiFi
+    //                       network; Clock: toggle focus timer; any other
+    //                       screen: no effect beyond the flash feedback
+    //                       (used to ask the daemon for an immediate poll
+    //                       over BLE — dropped when BLE was removed, see
+    //                       CLAUDE.md gotcha #14, since there's no clean
+    //                       device-initiated-push equivalent over HTTP).
     //   NOTE: GPIO18 = LCD SCLK (no right button); AXP PWR not present
     {
         static bool     btn_was = false;
@@ -537,12 +545,11 @@ void loop() {
             screen_t cs = ui_get_current_screen();
             if (cs == SCREEN_BLUETOOTH) {
                 ui_flash_feedback_strong();
-                ble_clear_bonds();
+                wifi_set_credentials("", "");   // "forget this network"
             } else if (cs == SCREEN_CLOCK) {
                 ui_timer_toggle();   // start/stop the focus timer (flashes itself)
             } else {
                 ui_flash_feedback_strong();
-                ble_request_refresh();
             }
         } else if (!btn_now && btn_was && !long_fired) {
             ui_flash_feedback();  // released before long-press threshold
@@ -561,13 +568,6 @@ void loop() {
             }
         }
         btn_was = btn_now;
-    }
-
-    // Update BLE status on screen when state changes
-    ble_state_t bs = ble_get_state();
-    if (bs != last_ble_state) {
-        last_ble_state = bs;
-        ui_update_ble_status(bs, ble_get_device_name(), ble_get_mac_address());
     }
 
     // Update WiFi status on screen when state changes (IP only settles once
@@ -615,12 +615,6 @@ void loop() {
 
     // Check for serial commands (screenshot, etc.)
     check_serial_cmd();
-
-    // Process incoming BLE data — route by "src" field (default: "claude")
-    if (ble_has_data()) {
-        if (process_payload(ble_get_data())) ble_send_ack();
-        else                                 ble_send_nack();
-    }
 
     delay(5);
 }

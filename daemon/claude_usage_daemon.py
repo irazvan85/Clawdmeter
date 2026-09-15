@@ -1,9 +1,19 @@
 #!/usr/bin/env python3
-"""Claude Usage Tracker Daemon (BLE) — macOS port of claude-usage-daemon.sh.
+"""Claude Usage Tracker Daemon.
 
-Polls Claude API rate-limit headers and writes a JSON payload to the
-ESP32 "Claude Controller" peripheral over a custom GATT service. Uses
-bleak (CoreBluetooth backend on macOS).
+Polls Claude API rate-limit headers and POSTs a JSON payload to the
+ESP32 device's HTTP server (see firmware/src/web_server.cpp), discovered
+via mDNS as clawdmeter.local. BLE was removed from the firmware (see
+CLAUDE.md gotcha #14 for why) -- WiFi is the sole transport now.
+
+mDNS resolution goes through the OS resolver (asyncio's getaddrinfo, which
+delegates to the platform DNS client) rather than a Python mDNS library --
+the `zeroconf` package's AsyncZeroconf has no direct hostname-resolve
+call, only service-type browsing, so it would've added a dependency for no
+real benefit. Windows 10+ and macOS both resolve ".local" names natively;
+Linux needs nss-mdns/avahi (common on desktop distros, not guaranteed on
+minimal ones) -- see resolve_device_ip()'s device_host config override for
+the escape hatch if OS-level resolution isn't available.
 """
 
 import asyncio
@@ -13,6 +23,7 @@ import math
 import os
 import re
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -20,17 +31,12 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import httpx
-from bleak import BleakClient, BleakScanner
-from bleak.exc import BleakError
 
 # Windows: prevent gh/git subprocess calls from flashing a console window
 # when the daemon itself runs without one (e.g. under the Scheduled Task).
 _NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 
-DEVICE_NAME = "Claude Controller"
-SERVICE_UUID = "4c41555a-4465-7669-6365-000000000001"
-RX_CHAR_UUID = "4c41555a-4465-7669-6365-000000000002"
-REQ_CHAR_UUID = "4c41555a-4465-7669-6365-000000000004"
+DEVICE_HOSTNAME = "clawdmeter.local"
 
 POLL_INTERVAL = 60
 COPILOT_POLL_INTERVAL = 300  # 5 minutes
@@ -49,7 +55,7 @@ MODEL_RATES = {
     "fable": (10.0, 50.0),
 }
 CLAUDE_CTX_WINDOW = 200_000  # Claude Code default working window
-SCAN_TIMEOUT = 8.0
+RESOLVE_TIMEOUT = 8.0
 
 # macOS: token lives in Keychain (service "Claude Code-credentials").
 # Linux: token lives in ~/.claude/.credentials.json.
@@ -57,7 +63,7 @@ KEYCHAIN_SERVICE = "Claude Code-credentials"
 DEFAULT_CONFIG_DIR = Path.home() / ".claude"
 CREDENTIALS_PATH = DEFAULT_CONFIG_DIR / ".credentials.json"
 CONFIG_FILE = Path.home() / ".config" / "claude-usage-monitor" / "config"
-SAVED_ADDR_FILE = Path.home() / ".config" / "claude-usage-monitor" / "ble-address"
+SAVED_ADDR_FILE = Path.home() / ".config" / "claude-usage-monitor" / "device-ip"
 LAST_PAYLOAD_FILE = Path.home() / ".config" / "claude-usage-monitor" / "last-payloads.json"
 GEO_CACHE_FILE = Path.home() / ".config" / "claude-usage-monitor" / "location.json"
 ACTIVITY_LOG = Path.home() / ".config" / "claude-usage-monitor" / "activity.log"
@@ -1167,11 +1173,7 @@ def load_cached_address() -> str | None:
     if not SAVED_ADDR_FILE.exists():
         return None
     addr = SAVED_ADDR_FILE.read_text().strip()
-    # Accept both Linux MAC (AA:BB:CC:DD:EE:FF) and macOS CoreBluetooth UUID
-    # (E621E1F8-C36C-495A-93FC-0C247A3E6E5F).
-    if re.fullmatch(r"(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}", addr) or re.fullmatch(
-        r"[0-9A-Fa-f]{8}-(?:[0-9A-Fa-f]{4}-){3}[0-9A-Fa-f]{12}", addr
-    ):
+    if re.fullmatch(r"(?:\d{1,3}\.){3}\d{1,3}", addr):
         return addr
     log("Cached address malformed, discarding")
     SAVED_ADDR_FILE.unlink(missing_ok=True)
@@ -1193,15 +1195,25 @@ def load_last_payloads() -> None:
     try:
         data = json.loads(LAST_PAYLOAD_FILE.read_text(encoding="utf-8"))
         if isinstance(data, dict):
-            _last_payloads = {k: v for k, v in data.items() if isinstance(v, dict)}
+            # "wifi" is excluded below too, but a payload cached by an older
+            # daemon build (back when push_wifi_credentials() sent one every
+            # connection) could still be sitting in this file -- never load
+            # a plaintext password back into memory just to resend it.
+            _last_payloads = {
+                k: v for k, v in data.items() if isinstance(v, dict) and k != "wifi"
+            }
     except (OSError, json.JSONDecodeError):
         _last_payloads = {}
 
 
 def remember_payload(payload: dict) -> None:
     src = payload.get("src", "claude")
-    if src in ("status", "act"):
-        return  # transient, not worth replaying
+    if src in ("status", "act", "wifi"):
+        # status/act: transient, not worth replaying. wifi: provisioning is
+        # a deliberate one-time manual step now (see CLAUDE.md) -- it should
+        # never be cached/auto-replayed, and doing so would mean a stored
+        # plaintext password gets resent on every future reconnect.
+        return
     _last_payloads[src] = payload
     try:
         LAST_PAYLOAD_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -1210,14 +1222,28 @@ def remember_payload(payload: dict) -> None:
         pass
 
 
-async def scan_for_device() -> str | None:
-    log(f"Scanning for '{DEVICE_NAME}' ({SCAN_TIMEOUT}s)...")
-    devices = await BleakScanner.discover(timeout=SCAN_TIMEOUT)
-    for d in devices:
-        if d.name == DEVICE_NAME:
-            log(f"Found: {d.address}")
-            return d.address
-    return None
+async def resolve_device_ip() -> str | None:
+    """Resolve the device's IP, via an optional manual override first (config
+    key `device_host` -- a hostname or IP, for setups where OS-level mDNS
+    resolution isn't available, e.g. Linux without nss-mdns/avahi), else
+    mDNS resolution of DEVICE_HOSTNAME through the OS resolver."""
+    cfg = read_config()
+    host = cfg.get("device_host", "").strip() or DEVICE_HOSTNAME
+    log(f"Resolving '{host}'...")
+    loop = asyncio.get_running_loop()
+    try:
+        infos = await asyncio.wait_for(
+            loop.getaddrinfo(host, 80, family=socket.AF_INET),
+            timeout=RESOLVE_TIMEOUT,
+        )
+    except (OSError, asyncio.TimeoutError) as e:
+        log(f"Resolve failed: {e}")
+        return None
+    if not infos:
+        return None
+    ip = infos[0][4][0]
+    log(f"Found: {ip}")
+    return ip
 
 
 async def poll_api(token: str) -> dict | None:
@@ -1280,64 +1306,57 @@ async def poll_api(token: str) -> dict | None:
 
 
 class Session:
-    def __init__(self, client: BleakClient) -> None:
-        self.client = client
-        self.refresh_requested = asyncio.Event()
+    """One target device, reached over HTTP. WiFi credentials are no longer
+    pushed here -- provisioning is now a one-time manual step over the
+    device's serial port (see CLAUDE.md), fully decoupled from the daemon.
+    The auth token (shown on the device's Connectivity screen once
+    connected) is a manual one-time config entry too -- see read_config()'s
+    `device_token` key."""
+
+    def __init__(self, base_url: str, token: str) -> None:
+        self.base_url = base_url
+        self.token = token
+        self.http = httpx.AsyncClient(timeout=10.0)
         self.write_fails = 0
 
     def link_broken(self) -> bool:
-        """Connected but writes keep failing (missing RX characteristic / stale
-        GATT table) — only a fresh connect, or a device power-cycle, fixes it."""
+        """Writes keep failing -- only a fresh IP re-resolve (mDNS or the
+        device having actually gone offline) fixes it."""
         return self.write_fails >= 4
 
-    def _on_refresh(self, _char, _data: bytearray) -> None:
-        log("Refresh requested by device")
-        self.refresh_requested.set()
-
-    async def setup_refresh_subscription(self) -> None:
+    async def probe(self) -> bool:
+        """Cheap reachability check before starting the poll loop -- HTTP has
+        no persistent "connected" state the way a BLE GATT link did, so
+        without this a dead IP wouldn't be noticed until write_fails hits 4,
+        which could take minutes given some payload types poll every
+        5-15 min."""
         try:
-            await self.client.start_notify(REQ_CHAR_UUID, self._on_refresh)
-        except (BleakError, ValueError) as e:
-            log(f"Refresh subscription unavailable: {e}")
-
-    async def write_payload(self, payload: dict) -> bool:
-        data = json.dumps(payload, separators=(",", ":")).encode()
-        log(f"Sending: {data.decode()}")
-
-        # Double‑check connection before writing
-        if not self.client.is_connected:
-            log("❌ BLE client not connected – cannot write")
+            resp = await self.http.get(f"{self.base_url}/api/state")
+            return resp.status_code == 200
+        except httpx.HTTPError as e:
+            log(f"Probe failed: {e}")
             return False
 
+    async def write_payload(self, payload: dict) -> bool:
+        data = json.dumps(payload, separators=(",", ":"))
+        log(f"Sending: {data}")
         try:
-            await self.client.write_gatt_char(RX_CHAR_UUID, data, response=False)
+            resp = await self.http.post(
+                f"{self.base_url}/api/payload",
+                content=data,
+                headers={"X-Auth-Token": self.token, "Content-Type": "application/json"},
+            )
+            if resp.status_code != 200:
+                self.write_fails += 1
+                log(f"Write failed ({self.write_fails}): HTTP {resp.status_code}")
+                return False
             self.write_fails = 0
             remember_payload(payload)
             return True
-        except BleakError as e:
+        except httpx.HTTPError as e:
             self.write_fails += 1
             log(f"Write failed ({self.write_fails}): {e}")
-            if self.link_broken():
-                log("RX characteristic unreachable - dropping the link to "
-                    "reconnect. If this repeats, power-cycle the device.")
-                try:
-                    await self.client.disconnect()
-                except BleakError:
-                    pass
             return False
-
-    async def push_wifi_credentials(self) -> None:
-        """One-shot per connection: if wifi_ssid/wifi_pass are set in the
-        config file, push them to the device over the existing RX channel
-        (same {"src":...} envelope as every other payload). The device
-        no-ops if they're unchanged (see firmware wifi_net.cpp's
-        wifi_set_credentials()), so resending on every connect is harmless
-        and self-heals if the config value changes."""
-        cfg = read_config()
-        ssid = cfg.get("wifi_ssid", "").strip()
-        if not ssid:
-            return
-        await self.write_payload({"src": "wifi", "ssid": ssid, "pass": cfg.get("wifi_pass", "")})
 
     async def replay_last_payloads(self) -> None:
         """Re-send the last known values so a fresh reconnect isn't blank."""
@@ -1345,32 +1364,42 @@ class Session:
             if await self.write_payload(payload):
                 log(f"Replayed cached {src} payload")
 
+    async def aclose(self) -> None:
+        await self.http.aclose()
 
-async def connect_and_run(address: str, stop_event: asyncio.Event) -> bool:
-    """Connect to a known address and poll until disconnected or stopped.
 
-    Returns True if the connection was used successfully (so the caller
-    keeps the cached address), False if the connection failed and the
-    cache should be invalidated.
+async def run_session(ip: str, stop_event: asyncio.Event) -> bool:
+    """Probe a resolved IP and poll until unreachable or stopped.
+
+    Returns True if the session was used successfully (so the caller keeps
+    the cached IP), False if the probe failed and the cache should be
+    invalidated so the next attempt re-resolves via mDNS.
     """
-    log(f"Connecting to {address}...")
-    client = BleakClient(address)
+    cfg = read_config()
+    token = cfg.get("device_token", "").strip()
+    if not token:
+        log("No device_token in config -- read it off the device's Connectivity "
+            "screen and add `device_token = ...` to the config file")
+        return False
+
+    base_url = f"http://{ip}"
+    session = Session(base_url, token)
     try:
-        await client.connect()
-    except (BleakError, asyncio.TimeoutError) as e:
-        log(f"Connection failed: {e}")
-        return False
+        log(f"Connecting to {base_url}...")
+        if not await session.probe():
+            log("Connection failed")
+            return False
 
-    if not client.is_connected:
-        log("Connection failed (no error but not connected)")
-        return False
+        log("Connected")
+        await session.replay_last_payloads()
 
-    log("Connected")
-    session = Session(client)
-    await session.setup_refresh_subscription()
-    await session.replay_last_payloads()
-    await session.push_wifi_credentials()
+        return await _poll_loop(session, stop_event)
+    finally:
+        await session.aclose()
 
+
+async def _poll_loop(session: Session, stop_event: asyncio.Event) -> bool:
+    used_successfully = False
     last_poll = 0.0
     last_copilot_poll = 0.0
     last_sysinfo_poll = 0.0
@@ -1382,7 +1411,6 @@ async def connect_and_run(address: str, stop_event: asyncio.Event) -> bool:
     last_act_sent = 0.0
     last_ci_poll = 0.0
     last_sum_poll = 0.0
-    used_successfully = False
 
     # Warm up cpu_percent so the first non-blocking call returns a real value
     try:
@@ -1391,95 +1419,88 @@ async def connect_and_run(address: str, stop_event: asyncio.Event) -> bool:
     except ImportError:
         pass
 
-    try:
-        while client.is_connected and not stop_event.is_set() and not session.link_broken():
-            now = time.time()
-            elapsed = now - last_poll
-            if session.refresh_requested.is_set() or elapsed >= POLL_INTERVAL:
-                session.refresh_requested.clear()
-                payload = await poll_active_payload()
-                last_poll = time.time()
-                if payload is None:
-                    state = "no_token" if not have_any_token() else "api_error"
-                    log(f"No Claude payload; sending status={state}")
-                    await session.write_payload(status_payload(state))
-                elif await session.write_payload(payload):
-                    used_successfully = True
+    while not stop_event.is_set() and not session.link_broken():
+        now = time.time()
+        elapsed = now - last_poll
+        if elapsed >= POLL_INTERVAL:
+            payload = await poll_active_payload()
+            last_poll = time.time()
+            if payload is None:
+                state = "no_token" if not have_any_token() else "api_error"
+                log(f"No Claude payload; sending status={state}")
+                await session.write_payload(status_payload(state))
+            elif await session.write_payload(payload):
+                used_successfully = True
 
-            try:
-                await asyncio.wait_for(session.refresh_requested.wait(), timeout=TICK)
-            except asyncio.TimeoutError:
-                pass
-
-            # GitHub Copilot poll every 5 minutes
-            now = time.time()
-            if now - last_copilot_poll >= COPILOT_POLL_INTERVAL:
-                last_copilot_poll = now
-                gh_token = read_github_token()
-                if gh_token:
-                    cp_payload = await poll_copilot(gh_token)
-                    if cp_payload is not None:
-                        await session.write_payload(cp_payload)
-                else:
-                    log("No GitHub token (install gh CLI and run 'gh auth login'); skipping Copilot poll")
-
-            # System info poll every 30 seconds
-            now = time.time()
-            if now - last_sysinfo_poll >= SYSINFO_POLL_INTERVAL:
-                last_sysinfo_poll = now
-                si_payload = poll_sysinfo()
-                await session.write_payload(si_payload)
-
-            # VS Code stats poll every 30 seconds
-            now = time.time()
-            if now - last_vscode_poll >= VSCODE_POLL_INTERVAL:
-                last_vscode_poll = now
-                vs_payload = poll_vscode()
-                await session.write_payload(vs_payload)
-
-            # Clock + weather every 15 minutes (also once, right after connect)
-            now = time.time()
-            if now - last_env_poll >= ENV_POLL_INTERVAL:
-                last_env_poll = now
-                await session.write_payload(await poll_env())
-
-            # Aurora borealis forecast every 5 minutes (same location as weather)
-            now = time.time()
-            if now - last_aurora_poll >= AURORA_POLL_INTERVAL:
-                last_aurora_poll = now
-                await session.write_payload(await poll_aurora())
-
-            # Claude activity — check often, send on change or as a 60s keepalive
-            now = time.time()
-            if now - last_act_poll >= ACT_POLL_INTERVAL:
-                last_act_poll = now
-                act = poll_activity()
-                if act["st"] != last_act_state or now - last_act_sent >= 60:
-                    if act["st"] != last_act_state:
-                        log(f"Activity: {act['st']} (agents={act['n']})")
-                    last_act_state, last_act_sent = act["st"], now
-                    await session.write_payload(act)
-
-            # CI status + review queue + git — every 2 min
-            now = time.time()
-            if now - last_ci_poll >= CI_POLL_INTERVAL:
-                last_ci_poll = now
-                ci = await asyncio.to_thread(poll_ci)
-                if ci is not None:
-                    await session.write_payload(ci)
-
-            # Daily summary — every 5 min
-            now = time.time()
-            if now - last_sum_poll >= SUM_POLL_INTERVAL:
-                last_sum_poll = now
-                await session.write_payload(await asyncio.to_thread(poll_summary))
-    finally:
         try:
-            await client.disconnect()
-        except BleakError:
+            await asyncio.wait_for(stop_event.wait(), timeout=TICK)
+        except asyncio.TimeoutError:
             pass
 
-    log("Device disconnected" if not stop_event.is_set() else "Stopping")
+        # GitHub Copilot poll every 5 minutes
+        now = time.time()
+        if now - last_copilot_poll >= COPILOT_POLL_INTERVAL:
+            last_copilot_poll = now
+            gh_token = read_github_token()
+            if gh_token:
+                cp_payload = await poll_copilot(gh_token)
+                if cp_payload is not None:
+                    await session.write_payload(cp_payload)
+            else:
+                log("No GitHub token (install gh CLI and run 'gh auth login'); skipping Copilot poll")
+
+        # System info poll every 30 seconds
+        now = time.time()
+        if now - last_sysinfo_poll >= SYSINFO_POLL_INTERVAL:
+            last_sysinfo_poll = now
+            si_payload = poll_sysinfo()
+            await session.write_payload(si_payload)
+
+        # VS Code stats poll every 30 seconds
+        now = time.time()
+        if now - last_vscode_poll >= VSCODE_POLL_INTERVAL:
+            last_vscode_poll = now
+            vs_payload = poll_vscode()
+            await session.write_payload(vs_payload)
+
+        # Clock + weather every 15 minutes (also once, right after connect)
+        now = time.time()
+        if now - last_env_poll >= ENV_POLL_INTERVAL:
+            last_env_poll = now
+            await session.write_payload(await poll_env())
+
+        # Aurora borealis forecast every 5 minutes (same location as weather)
+        now = time.time()
+        if now - last_aurora_poll >= AURORA_POLL_INTERVAL:
+            last_aurora_poll = now
+            await session.write_payload(await poll_aurora())
+
+        # Claude activity — check often, send on change or as a 60s keepalive
+        now = time.time()
+        if now - last_act_poll >= ACT_POLL_INTERVAL:
+            last_act_poll = now
+            act = poll_activity()
+            if act["st"] != last_act_state or now - last_act_sent >= 60:
+                if act["st"] != last_act_state:
+                    log(f"Activity: {act['st']} (agents={act['n']})")
+                last_act_state, last_act_sent = act["st"], now
+                await session.write_payload(act)
+
+        # CI status + review queue + git — every 2 min
+        now = time.time()
+        if now - last_ci_poll >= CI_POLL_INTERVAL:
+            last_ci_poll = now
+            ci = await asyncio.to_thread(poll_ci)
+            if ci is not None:
+                await session.write_payload(ci)
+
+        # Daily summary — every 5 min
+        now = time.time()
+        if now - last_sum_poll >= SUM_POLL_INTERVAL:
+            last_sum_poll = now
+            await session.write_payload(await asyncio.to_thread(poll_summary))
+
+    log("Link broken, will re-resolve" if not stop_event.is_set() else "Stopping")
     return used_successfully
 
 
@@ -1497,17 +1518,17 @@ async def main() -> None:
         except NotImplementedError:
             signal.signal(sig, _stop)
 
-    log("=== Claude Usage Tracker Daemon (BLE) ===")
+    log("=== Claude Usage Tracker Daemon ===")
     log(f"Poll interval: {POLL_INTERVAL}s")
     load_last_payloads()
 
     backoff = 1
     while not stop_event.is_set():
-        address = load_cached_address()
-        if not address:
-            address = await scan_for_device()
-            if address:
-                save_address(address)
+        ip = load_cached_address()
+        if not ip:
+            ip = await resolve_device_ip()
+            if ip:
+                save_address(ip)
             else:
                 log(f"Device not found, retrying in {backoff}s...")
                 try:
@@ -1517,7 +1538,7 @@ async def main() -> None:
                 backoff = min(backoff * 2, 60)
                 continue
 
-        ok = await connect_and_run(address, stop_event)
+        ok = await run_session(ip, stop_event)
         if not ok:
             log("Invalidating cached address")
             SAVED_ADDR_FILE.unlink(missing_ok=True)

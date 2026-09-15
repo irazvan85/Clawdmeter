@@ -4,7 +4,6 @@
 #include <math.h>
 #include <string.h>
 #include <time.h>
-#include "ble.h"
 #include "usage_rate.h"
 #include "logo.h"
 #include "icons.h"
@@ -53,12 +52,12 @@ static lv_obj_t* lbl_weekly_label;
 static lv_obj_t* lbl_weekly_reset;
 static lv_obj_t* lbl_anim;
 
-// ---- Bluetooth screen widgets ----
-static lv_obj_t* ble_container;
-static lv_obj_t* lbl_ble_status;
-static lv_obj_t* lbl_ble_device;
-static lv_obj_t* lbl_ble_mac;
+// ---- Connectivity screen widgets ----
+static lv_obj_t* conn_container;
 static lv_obj_t* lbl_wifi_status;
+static lv_obj_t* lbl_wifi_detail;  // IP once connected
+static lv_obj_t* lbl_wifi_token;   // auth token once connected
+static lv_obj_t* lbl_wifi_host;    // mDNS hostname once connected
 
 // ---- Copilot screen widgets ----
 static lv_obj_t* copilot_container;
@@ -969,6 +968,7 @@ static void init_aurora_screen(lv_obj_t* scr) {
 void ui_update_aurora(const AuroraData* data) {
     if (!data->valid) return;
     note_data();
+    if (!aurora_has_data) init_aurora_screen(lv_screen_active());
     aurora_has_data = true;
 
     if (data->pct >= 0) {
@@ -1009,55 +1009,54 @@ void ui_update_aurora(const AuroraData* data) {
     }
 }
 
-// Info panel grew by one line (WiFi status) beyond the original BLE-only
-// 108px — CONN_PANEL_H is the single source of truth so reset_zone below it
-// stays derived, not a second magic number to keep in sync.
-#define CONN_PANEL_H 124
+// CONN_PANEL_H is the single source of truth so reset_zone below it stays
+// derived, not a second magic number to keep in sync. IP and token get
+// their own lines (not combined on one, which clipped against the 121px
+// content width once IP octets ran long — e.g. "192.168.1.54  *  ABCD1234"
+// doesn't fit at font_styrene_12) so both are always fully readable.
+#define CONN_PANEL_H 88
 
 static void init_bluetooth_screen(lv_obj_t* scr) {
-    ble_container = make_screen_container(scr, "Connectivity");
+    conn_container = make_screen_container(scr, "Connectivity");
 
     // Info panel
-    lv_obj_t* p_info = make_panel(ble_container, MARGIN, CONTENT_Y, CONTENT_W, CONN_PANEL_H);
+    lv_obj_t* p_info = make_panel(conn_container, MARGIN, CONTENT_Y, CONTENT_W, CONN_PANEL_H);
 
-    // Bluetooth icon (centered at top of panel)
-    static lv_image_dsc_t icon_bt_dsc;
-    init_icon_dsc(&icon_bt_dsc, ICON_BLUETOOTH_W, ICON_BLUETOOTH_H, icon_bluetooth_data);
-
-    lv_obj_t* bt_img = lv_image_create(p_info);
-    lv_image_set_src(bt_img, &icon_bt_dsc);
-    lv_obj_set_pos(bt_img, (CONTENT_W - 16 - ICON_BLUETOOTH_W) / 2, 0);
-
-    lbl_ble_status = lv_label_create(p_info);
-    lv_label_set_text(lbl_ble_status, "Initializing...");
-    lv_obj_set_style_text_font(lbl_ble_status, &font_styrene_14, 0);
-    lv_obj_set_style_text_color(lbl_ble_status, COL_DIM, 0);
-    lv_obj_set_pos(lbl_ble_status, 0, 52);
-
-    lbl_ble_device = lv_label_create(p_info);
-    lv_label_set_text(lbl_ble_device, "---");
-    lv_obj_set_style_text_font(lbl_ble_device, &font_styrene_12, 0);
-    lv_obj_set_style_text_color(lbl_ble_device, COL_DIM, 0);
-    lv_obj_set_pos(lbl_ble_device, 0, 70);
-
-    lbl_ble_mac = lv_label_create(p_info);
-    lv_label_set_text(lbl_ble_mac, "---");
-    lv_obj_set_style_text_font(lbl_ble_mac, &font_styrene_12, 0);
-    lv_obj_set_style_text_color(lbl_ble_mac, COL_DIM, 0);
-    lv_obj_set_pos(lbl_ble_mac, 0, 86);
-
-    // WiFi is additive to BLE — one compact line: IP + auth token once
-    // connected (both needed to reach the HTTP dashboard), else the state.
+    // Headline: connection state ("Not set up" / "Connecting..." / "Failed" /
+    // "Connected"), colour-coded — see ui_update_wifi_status().
     lbl_wifi_status = lv_label_create(p_info);
     lv_label_set_text(lbl_wifi_status, "WiFi: not set up");
-    lv_obj_set_style_text_font(lbl_wifi_status, &font_styrene_12, 0);
+    lv_obj_set_style_text_font(lbl_wifi_status, &font_styrene_14, 0);
     lv_obj_set_style_text_color(lbl_wifi_status, COL_DIM, 0);
-    lv_obj_set_pos(lbl_wifi_status, 0, 102);
+    lv_obj_set_pos(lbl_wifi_status, 0, 0);
 
-    // Unpair hint — the action is a long-press of the physical button while
-    // this screen is showing (see main.cpp). No touch on this board.
+    // IP once connected (needed to reach the HTTP dashboard) — blank otherwise.
+    lbl_wifi_detail = lv_label_create(p_info);
+    lv_label_set_text(lbl_wifi_detail, "");
+    lv_obj_set_style_text_font(lbl_wifi_detail, &font_styrene_12, 0);
+    lv_obj_set_style_text_color(lbl_wifi_detail, COL_DIM, 0);
+    lv_obj_set_pos(lbl_wifi_detail, 0, 24);
+
+    // Auth token once connected (POST /api/payload's X-Auth-Token) — its own
+    // line, not appended to the IP line, so it's never clipped.
+    lbl_wifi_token = lv_label_create(p_info);
+    lv_label_set_text(lbl_wifi_token, "");
+    lv_obj_set_style_text_font(lbl_wifi_token, &font_styrene_12, 0);
+    lv_obj_set_style_text_color(lbl_wifi_token, COL_DIM, 0);
+    lv_obj_set_pos(lbl_wifi_token, 0, 44);
+
+    // mDNS hostname (web_server.cpp calls MDNS.begin("clawdmeter")) — an
+    // alternative to typing the IP, once connected.
+    lbl_wifi_host = lv_label_create(p_info);
+    lv_label_set_text(lbl_wifi_host, "");
+    lv_obj_set_style_text_font(lbl_wifi_host, &font_styrene_12, 0);
+    lv_obj_set_style_text_color(lbl_wifi_host, COL_DIM, 0);
+    lv_obj_set_pos(lbl_wifi_host, 0, 64);
+
+    // Forget-network hint — the action is a long-press of the physical
+    // button while this screen is showing (see main.cpp). No touch on this board.
     int reset_y = CONTENT_Y + CONN_PANEL_H + 8;
-    lv_obj_t* reset_zone = lv_obj_create(ble_container);
+    lv_obj_t* reset_zone = lv_obj_create(conn_container);
     lv_obj_set_pos(reset_zone, MARGIN, reset_y);
     lv_obj_set_size(reset_zone, CONTENT_W, 38);
     lv_obj_set_style_bg_color(reset_zone, COL_PANEL, 0);
@@ -1069,25 +1068,25 @@ static void init_bluetooth_screen(lv_obj_t* scr) {
     lv_obj_clear_flag(reset_zone, LV_OBJ_FLAG_SCROLLABLE);
 
     lv_obj_t* reset_lbl = lv_label_create(reset_zone);
-    lv_label_set_text(reset_lbl, "Hold button to unpair");
+    lv_label_set_text(reset_lbl, "Hold button to forget network");
     lv_obj_set_style_text_font(reset_lbl, &font_styrene_12, 0);
     lv_obj_set_style_text_color(reset_lbl, COL_DIM, 0);
 
     // Attribution
-    lv_obj_t* lbl_credit = lv_label_create(ble_container);
+    lv_obj_t* lbl_credit = lv_label_create(conn_container);
     lv_label_set_text(lbl_credit, "@hermannbjorgvin");
     lv_obj_set_style_text_font(lbl_credit, &font_styrene_12, 0);
     lv_obj_set_style_text_color(lbl_credit, COL_DIM, 0);
     lv_obj_align(lbl_credit, LV_ALIGN_BOTTOM_MID, 0, -22);
 
-    lv_obj_t* lbl_credit2 = lv_label_create(ble_container);
+    lv_obj_t* lbl_credit2 = lv_label_create(conn_container);
     lv_label_set_text(lbl_credit2, "@amaanbuilds");
     lv_obj_set_style_text_font(lbl_credit2, &font_styrene_12, 0);
     lv_obj_set_style_text_color(lbl_credit2, COL_DIM, 0);
     lv_obj_align(lbl_credit2, LV_ALIGN_BOTTOM_MID, 0, -4);
 
     // Start hidden
-    lv_obj_add_flag(ble_container, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(conn_container, LV_OBJ_FLAG_HIDDEN);
 }
 
 // ======== Checks Screen (CI + review queue + git) ========
@@ -1193,6 +1192,11 @@ static lv_obj_t* lbl_sensor_hum_v;
 static lv_obj_t* lbl_sensor_press_label;  // repositioned depending on whether Humidity is shown
 static lv_obj_t* lbl_sensor_press_v;
 static bool sensor_has_data = false;
+// Separate from sensor_has_data: that flag tracks the *current* reading
+// (toggles back to false on a transient I2C error), but the screen must
+// only ever be lazily built once -- gating creation on sensor_has_data
+// directly would rebuild (leak/duplicate) the widgets on every recovery.
+static bool sensor_created = false;
 static bool sensor_shows_humidity = true;   // current layout state — reposition only when this changes;
                                             // seeded to match the as-built layout (humidity row present)
 
@@ -1640,17 +1644,20 @@ void ui_init(void) {
     // Initialize battery icon descriptors
     init_battery_icons();
 
+    // Only the always-reachable screens (see screen_is_populated()'s
+    // `default: true` case) are built eagerly here. The data-gated screens
+    // (sysinfo/vscode/ci/today/aurora/sensor/sensor-graph) are lazily built
+    // the first time their own ui_update_X() actually receives data -- see
+    // each function's "if (!X_has_data) init_X_screen(...)" guard. This was
+    // added to fix CLAUDE.md gotcha #14: building the full 12-screen UI
+    // eagerly, on top of WiFi's own one-time ~52 KB driver allocation,
+    // didn't fit in this no-PSRAM board's heap and crashed inside LVGL's
+    // allocator with a null-pointer write. Building only the ~5 always-on
+    // screens upfront (the other 7 arrive gradually, spread over the whole
+    // session as real payloads land) keeps peak heap well under budget.
     init_env_screen(scr);
-    init_aurora_screen(scr);
     init_usage_screen(scr);
     init_copilot_screen(scr);
-    init_sysinfo_screen(scr);
-    init_vscode_screen(scr);
-    init_ci_screen(scr);
-    init_today_screen(scr);
-    init_sensor_screen(scr);
-    init_sensor_spark();
-    init_trend_screen(scr);
     init_bluetooth_screen(scr);
     splash_init(scr);
 
@@ -1923,6 +1930,7 @@ void ui_update_copilot(const CopilotData* data) {
 void ui_update_sysinfo(const SysInfoData* data) {
     if (!data->valid) return;
     note_data();
+    if (!sysinfo_has_data) init_sysinfo_screen(lv_screen_active());
     sysinfo_has_data = true;
 
     char buf[40];
@@ -1975,6 +1983,7 @@ void ui_update_sysinfo(const SysInfoData* data) {
 void ui_update_vscode(const VscodeData* data) {
     if (!data->valid) return;
     note_data();
+    if (!vscode_has_data) init_vscode_screen(lv_screen_active());
     vscode_has_data = true;
 
     char buf[40];
@@ -2071,6 +2080,7 @@ void ui_update_env(const EnvData* data) {
 void ui_update_ci(const CiData* data) {
     if (!data->valid) return;
     note_data();
+    if (!ci_has_data) init_ci_screen(lv_screen_active());
     ci_has_data = true;
 
     lv_color_t dc; const char* st;
@@ -2151,6 +2161,7 @@ void ui_update_ci(const CiData* data) {
 void ui_update_today(const TodayData* data) {
     if (!data->valid) return;
     note_data();
+    if (!today_has_data) init_today_screen(lv_screen_active());
     today_has_data = true;
     char b[16];
 
@@ -2197,6 +2208,13 @@ const char* ui_get_daemon_state(void) { return daemon_state; }
 void ui_update_sensor(bool present, float temp_c, float pressure_hpa,
                        bool has_humidity, float humidity_pct) {
     sensor_has_data = present;
+    if (present && !sensor_created) {
+        lv_obj_t* scr = lv_screen_active();
+        init_sensor_screen(scr);
+        init_sensor_spark();
+        init_trend_screen(scr);
+        sensor_created = true;
+    }
     if (!present) {
         g_env_t = g_env_h = g_env_p = NAN;
         if (lbl_clock_intemp) {
@@ -2281,8 +2299,7 @@ static bool quota_verdict(char* buf, size_t n, lv_color_t* col) {
 // True when the daemon link is healthy: connected, has sent data, recently,
 // and not reporting an error state.
 static bool data_is_live(void) {
-    return ble_get_state() == BLE_STATE_CONNECTED
-        && ever_data
+    return ever_data
         && (lv_tick_get() - last_data_ms) < STALE_MS
         && (daemon_state[0] == '\0' || strcmp(daemon_state, "ok") == 0);
 }
@@ -2291,8 +2308,8 @@ static bool data_is_live(void) {
 // "offline", "waiting", or a daemon error ("no token"). Hidden on splash.
 static void refresh_status_label(void) {
     if (!lbl_status_corner) return;
-    // Splash has no header; the Bluetooth screen shows connection state in full
-    // already (and "Bluetooth" is wide enough to crowd the pill).
+    // Splash has no header; the Connectivity screen shows WiFi state in full
+    // already (and its title is wide enough to crowd the pill).
     if (current_screen == SCREEN_SPLASH || current_screen == SCREEN_BLUETOOTH) {
         lv_obj_add_flag(lbl_status_corner, LV_OBJ_FLAG_HIDDEN);
         if (act_dot) lv_obj_add_flag(act_dot, LV_OBJ_FLAG_HIDDEN);
@@ -2320,10 +2337,7 @@ static void refresh_status_label(void) {
     lv_color_t  col;
     uint32_t    age = lv_tick_get() - last_data_ms;
 
-    if (ble_get_state() != BLE_STATE_CONNECTED) {
-        txt = "offline";
-        col = COL_RED;
-    } else if (daemon_state[0] != '\0' && strcmp(daemon_state, "ok") != 0) {
+    if (daemon_state[0] != '\0' && strcmp(daemon_state, "ok") != 0) {
         if      (strcmp(daemon_state, "no_token") == 0)  txt = "no token";
         else if (strcmp(daemon_state, "api_error") == 0) txt = "API error";
         else                                            txt = daemon_state;
@@ -2411,9 +2425,7 @@ void ui_tick_anim(void) {
     // activity that isn't happening — show a static status line instead.
     if (!data_is_live()) {
         lv_obj_set_style_text_color(lbl_anim, COL_DIM, 0);
-        lv_label_set_text(lbl_anim,
-            ble_get_state() == BLE_STATE_CONNECTED ? "waiting\xE2\x80\xA6"
-                                                   : "offline");
+        lv_label_set_text(lbl_anim, ever_data ? "stale" : "waiting\xE2\x80\xA6");
         return;
     }
 
@@ -2469,17 +2481,28 @@ static void apply_battery_visibility(void) {
 }
 
 void ui_show_screen(screen_t screen) {
+    // Data-gated screens (sysinfo/vscode/ci/today/aurora/sensor/sensor-graph)
+    // are now lazily built on first data (see ui_init()'s comment) -- their
+    // containers are null until then. ui_cycle_screen() already skips
+    // unpopulated screens, but this is also reachable directly (the serial
+    // `screen <n>` QA command), so guard here too rather than dereference a
+    // null container.
+    if (!screen_is_populated(screen)) screen = SCREEN_CLOCK;
+
+    // clock/usage/copilot/ble containers are built eagerly in ui_init() and
+    // always exist. The other 7 are now lazily built on first data (see
+    // ui_init()'s comment) -- null until then, so guard those.
     lv_obj_add_flag(clock_container, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_flag(aurora_container, LV_OBJ_FLAG_HIDDEN);
+    if (aurora_container)   lv_obj_add_flag(aurora_container, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(usage_container, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(copilot_container, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_flag(sysinfo_container, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_flag(vscode_container, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_flag(ci_container, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_flag(today_container, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_flag(sensor_container, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_flag(trend_container, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_flag(ble_container, LV_OBJ_FLAG_HIDDEN);
+    if (sysinfo_container)  lv_obj_add_flag(sysinfo_container, LV_OBJ_FLAG_HIDDEN);
+    if (vscode_container)   lv_obj_add_flag(vscode_container, LV_OBJ_FLAG_HIDDEN);
+    if (ci_container)       lv_obj_add_flag(ci_container, LV_OBJ_FLAG_HIDDEN);
+    if (today_container)    lv_obj_add_flag(today_container, LV_OBJ_FLAG_HIDDEN);
+    if (sensor_container)   lv_obj_add_flag(sensor_container, LV_OBJ_FLAG_HIDDEN);
+    if (trend_container)    lv_obj_add_flag(trend_container, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(conn_container, LV_OBJ_FLAG_HIDDEN);
     splash_hide();
 
     switch (screen) {
@@ -2510,7 +2533,7 @@ void ui_show_screen(screen_t screen) {
         lv_obj_clear_flag(trend_container, LV_OBJ_FLAG_HIDDEN);
         refresh_trend_screen();
         break;
-    case SCREEN_BLUETOOTH:  lv_obj_clear_flag(ble_container, LV_OBJ_FLAG_HIDDEN); break;
+    case SCREEN_BLUETOOTH:  lv_obj_clear_flag(conn_container, LV_OBJ_FLAG_HIDDEN); break;
     default: break;
     }
 
@@ -2556,52 +2579,37 @@ screen_t ui_get_current_screen(void) {
     return current_screen;
 }
 
-void ui_update_ble_status(ble_state_t state, const char* name, const char* mac) {
-    switch (state) {
-    case BLE_STATE_CONNECTED:
-        lv_label_set_text(lbl_ble_status, "Connected");
-        lv_obj_set_style_text_color(lbl_ble_status, COL_GREEN, 0);
-        break;
-    case BLE_STATE_ADVERTISING:
-        lv_label_set_text(lbl_ble_status, "Advertising...");
-        lv_obj_set_style_text_color(lbl_ble_status, COL_AMBER, 0);
-        break;
-    case BLE_STATE_DISCONNECTED:
-        lv_label_set_text(lbl_ble_status, "Disconnected");
-        lv_obj_set_style_text_color(lbl_ble_status, COL_RED, 0);
-        break;
-    default:
-        lv_label_set_text(lbl_ble_status, "Initializing...");
-        lv_obj_set_style_text_color(lbl_ble_status, COL_DIM, 0);
-        break;
-    }
-
-    // Raw name/MAC — no "Device:"/"Address:" prefix; a 123px panel can't hold it.
-    if (name) lv_label_set_text(lbl_ble_device, name);
-    if (mac)  lv_label_set_text(lbl_ble_mac, mac);
-}
-
 void ui_update_wifi_status(wifi_state_t state, const char* ip, const char* token) {
     if (!lbl_wifi_status) return;
-    char b[40];
     switch (state) {
     case WIFI_STATE_CONNECTED:
-        // Both needed to reach the dashboard, so one line carries both.
-        snprintf(b, sizeof(b), "%s  *  %s", ip, token);
-        lv_label_set_text(lbl_wifi_status, b);
+        lv_label_set_text(lbl_wifi_status, "Connected");
         lv_obj_set_style_text_color(lbl_wifi_status, COL_GREEN, 0);
+        lv_label_set_text(lbl_wifi_detail, ip);
+        lv_label_set_text(lbl_wifi_token, token);
+        // web_server.cpp calls MDNS.begin("clawdmeter") once connected.
+        lv_label_set_text(lbl_wifi_host, "clawdmeter.local");
         break;
     case WIFI_STATE_CONNECTING:
         lv_label_set_text(lbl_wifi_status, "WiFi: connecting");
         lv_obj_set_style_text_color(lbl_wifi_status, COL_AMBER, 0);
+        lv_label_set_text(lbl_wifi_detail, "");
+        lv_label_set_text(lbl_wifi_token, "");
+        lv_label_set_text(lbl_wifi_host, "");
         break;
     case WIFI_STATE_FAILED:
         lv_label_set_text(lbl_wifi_status, "WiFi: failed");
         lv_obj_set_style_text_color(lbl_wifi_status, COL_RED, 0);
+        lv_label_set_text(lbl_wifi_detail, "");
+        lv_label_set_text(lbl_wifi_token, "");
+        lv_label_set_text(lbl_wifi_host, "");
         break;
     default:
         lv_label_set_text(lbl_wifi_status, "WiFi: not set up");
         lv_obj_set_style_text_color(lbl_wifi_status, COL_DIM, 0);
+        lv_label_set_text(lbl_wifi_detail, "");
+        lv_label_set_text(lbl_wifi_token, "");
+        lv_label_set_text(lbl_wifi_host, "");
         break;
     }
 }

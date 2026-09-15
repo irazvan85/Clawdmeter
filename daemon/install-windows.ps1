@@ -3,13 +3,17 @@
   Install the Clawdmeter usage daemon as a per-user Scheduled Task on Windows.
 
 .DESCRIPTION
-  Creates daemon\.venv (bleak + httpx + psutil) if missing, then registers a
+  Creates daemon\.venv (httpx + psutil) if missing, then registers a
   Scheduled Task that starts the daemon at logon, runs it hidden in your user
-  session (so BLE, `gh`, and ~/.claude credentials all work), restarts it on
+  session (so `gh` and ~/.claude credentials all work), restarts it on
   failure, and never times out.
 
-  A true session-0 Windows service is intentionally NOT used: bleak's WinRT
-  Bluetooth backend can't enumerate devices outside an interactive session.
+  A true session-0 Windows service isn't used here for now -- historically
+  that was because bleak's WinRT Bluetooth backend couldn't enumerate
+  devices outside an interactive session, which no longer applies now that
+  the daemon talks to the device over HTTP instead of BLE (see CLAUDE.md
+  gotcha #14). Switching to a real Service (so the daemon survives
+  logoff/lock-screen) is a reasonable follow-up, just not done here.
 
 .PARAMETER Uninstall
   Remove the Scheduled Task (leaves the venv and logs in place).
@@ -50,7 +54,7 @@ if (-not (Test-Path $pythonw)) {
     Write-Host "Creating venv in $venvDir ..."
     & $basePy -m venv $venvDir
     & $pip -m pip install --quiet --upgrade pip
-    & $pip -m pip install --quiet bleak httpx psutil
+    & $pip -m pip install --quiet httpx psutil
 }
 
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
@@ -71,7 +75,7 @@ $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME `
 
 Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger `
     -Settings $settings -Principal $principal -Force `
-    -Description 'Clawdmeter: push Claude / Copilot / host usage to the ESP32 over BLE' | Out-Null
+    -Description 'Clawdmeter: push Claude / Copilot / host usage to the ESP32 over WiFi' | Out-Null
 
 Start-ScheduledTask -TaskName $TaskName
 

@@ -1,6 +1,5 @@
 #pragma once
 #include "data.h"
-#include "ble.h"
 #include "wifi_net.h"
 
 enum screen_t {
@@ -49,6 +48,5 @@ void ui_toggle_splash(void);
 void ui_flash_feedback(void);         // light pulse — short press
 void ui_flash_feedback_strong(void);  // firmer pulse — long press / action
 screen_t ui_get_current_screen(void);
-void ui_update_ble_status(ble_state_t state, const char* name, const char* mac);
 void ui_update_wifi_status(wifi_state_t state, const char* ip, const char* token);
 void ui_update_battery(int percent, bool charging);

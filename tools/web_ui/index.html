@@ -158,10 +158,10 @@
   </div>
 
 <script>
-function dotClass(state) {
-  if (state === 2) return 'ok';    // BLE_STATE_CONNECTED
-  if (state === 1) return 'warn';  // advertising / connecting
-  return 'bad';
+function dotClass(wifiState) {
+  if (wifiState === 2) return 'ok';    // WIFI_STATE_CONNECTED
+  if (wifiState === 1) return 'warn';  // WIFI_STATE_CONNECTING
+  return 'bad';                        // WIFI_STATE_OFF or WIFI_STATE_FAILED
 }
 
 function fmtPct(v) { return (v === null || v === undefined || v < 0) ? '--' : Math.round(v) + '%'; }
@@ -178,8 +178,8 @@ async function refreshState() {
 
   const conn = d.connectivity || {};
   document.getElementById('conn-line').innerHTML =
-    '<span class="dot ' + dotClass(conn.ble_state) + '"></span>BLE &middot; ' +
-    (conn.wifi_ip ? conn.wifi_ip : 'wifi: no IP');
+    '<span class="dot ' + dotClass(conn.wifi_state) + '"></span>WiFi &middot; ' +
+    (conn.wifi_ip ? conn.wifi_ip : 'no IP');
 
   const c = d.claude || {};
   document.getElementById('claude-pct').textContent = fmtPct(c.session_pct);
