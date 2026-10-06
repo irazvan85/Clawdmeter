@@ -1,8 +1,8 @@
 ---
-description: "Add or revise a Clawdmeter LVGL screen using the 135x240 layout, serial screenshot QA, and existing data contracts."
-agent: "Firmware Orchestrator"
+name: add-ui-screen
+description: Add or revise a Clawdmeter LVGL screen using the 135x240 layout, serial screenshot QA, and existing data contracts.
+disable-model-invocation: true
 ---
-
 Implement this display request:
 
 $ARGUMENTS

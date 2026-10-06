@@ -1,8 +1,8 @@
 ---
-description: "Run Clawdmeter release-readiness checks across firmware, daemon, assets, documentation, BLE compatibility, and available hardware validation."
-agent: "Firmware Orchestrator"
+name: prepare-release
+description: Run Clawdmeter release-readiness checks across firmware, daemon, assets, documentation, BLE compatibility, and available hardware validation.
+disable-model-invocation: true
 ---
-
 Prepare the project for release:
 
 $ARGUMENTS

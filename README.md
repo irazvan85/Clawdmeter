@@ -266,11 +266,22 @@ the same time (see [`CLAUDE.md`](CLAUDE.md) for the full story).
 | `GET /api/state`           | open                      | JSON mirror of everything the device holds |
 | `GET /api/screenshot.bmp`  | open                      | Current LCD frame as a 24-bpp BMP         |
 | `POST /api/payload`        | `X-Auth-Token` header     | The daemon's data-push path (below)       |
+| `GET /api/config`          | open                      | Current theme index + screen-visibility mask |
+| `POST /api/config`         | `X-Auth-Token` header     | Set theme (`theme=N`) and/or visibility (`mask=N`), form-encoded |
 
 The device generates an 8-character auth token on first WiFi connect (shown on
 the Connectivity screen); `GET /api/state` deliberately never exposes it, or
 an open read route would leak the credential that's supposed to gate the one
 write route.
+
+The dashboard's Settings card (`GET`/`POST /api/config`) lets you pick a theme
+preset and hide screens you don't care about from the button-cycle order —
+Clock and Connectivity can't be hidden. Changing the theme restarts the device
+(~15 s; LVGL has no live-restyle hook) and screens repopulate as the daemon
+reports back in; toggling visibility applies immediately, no restart. The
+token gate is the same as `/api/payload`'s — the page prompts for it once and
+remembers it in the browser's local storage (per-origin, so switching between
+`clawdmeter.local` and a raw IP needs re-entering it).
 
 Payloads POSTed to `/api/payload` are compact JSON, routed by a `src` field
 (default `claude`) — the same shapes as before, just POSTed instead of written

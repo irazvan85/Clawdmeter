@@ -3,8 +3,10 @@
 
 Polls Claude API rate-limit headers and POSTs a JSON payload to the
 ESP32 device's HTTP server (see firmware/src/web_server.cpp), discovered
-via mDNS as clawdmeter.local. BLE was removed from the firmware (see
-CLAUDE.md gotcha #14 for why) -- WiFi is the sole transport now.
+via mDNS as clawdmeter.local, falling back to a UDP broadcast discovery
+protocol (see firmware/src/discovery.h) when mDNS resolution fails. BLE was
+removed from the firmware (see CLAUDE.md gotcha #14 for why) -- WiFi is the
+sole transport now.
 
 mDNS resolution goes through the OS resolver (asyncio's getaddrinfo, which
 delegates to the platform DNS client) rather than a Python mDNS library --
@@ -12,8 +14,13 @@ the `zeroconf` package's AsyncZeroconf has no direct hostname-resolve
 call, only service-type browsing, so it would've added a dependency for no
 real benefit. Windows 10+ and macOS both resolve ".local" names natively;
 Linux needs nss-mdns/avahi (common on desktop distros, not guaranteed on
-minimal ones) -- see resolve_device_ip()'s device_host config override for
-the escape hatch if OS-level resolution isn't available.
+minimal ones); **stock Windows with no Bonjour/iTunes install has no mDNS
+stub resolver at all**, so getaddrinfo() fails outright rather than timing
+out (confirmed via a real incident -- see CLAUDE.md). resolve_device_ip()
+tries the device_host config override (or clawdmeter.local) via getaddrinfo()
+first, then falls back to a UDP broadcast ("is anyone out there?") which
+needs no OS mDNS support at all. See that function for the full fallback
+order.
 """
 
 import asyncio
@@ -37,6 +44,17 @@ import httpx
 _NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
 
 DEVICE_HOSTNAME = "clawdmeter.local"
+
+# UDP broadcast discovery (firmware/src/discovery.h) -- a fallback for
+# networks where OS-level mDNS resolution of DEVICE_HOSTNAME isn't available
+# (e.g. stock Windows with no Bonjour service installed has no ".local"
+# resolver at all; see CLAUDE.md's clawdmeter.local incident). Also used
+# standalone by tools/discover_device.py.
+DISCOVERY_PORT = 42424
+DISCOVERY_REQUEST = b"CLAWDMETER_DISCOVER_V1"
+DISCOVERY_REPLY = b"CLAWDMETER_HELLO_V1"
+DISCOVERY_TIMEOUT = 2.0
+
 
 POLL_INTERVAL = 60
 COPILOT_POLL_INTERVAL = 300  # 5 minutes
@@ -98,6 +116,17 @@ OAUTH_TOKEN_URLS = (
     "https://platform.claude.com/v1/oauth/token",
 )
 _LAST_API_STATUS = 0   # HTTP status of the most recent poll_api() call
+
+# Cooldown after a rate-limited OAuth refresh attempt, keyed by config dir --
+# retrying every poll cycle just hammers the endpoint and prolongs the limit.
+_refresh_backoff_until: dict[Path, float] = {}
+_REFRESH_BACKOFF_DEFAULT = 300  # seconds, used when the response has no Retry-After
+# Consecutive rate-limited refresh failures per config dir, keyed the same way.
+# A flat 300s retry held up for days (a real incident -- see CLAUDE.md) risks
+# being the thing that keeps a rolling-window rate limit alive; back off
+# exponentially instead, capped so recovery still resumes within an hour.
+_refresh_fail_streak: dict[Path, int] = {}
+_REFRESH_BACKOFF_MAX = 1800  # seconds (30 min)
 
 
 _LOG_FILE: Path | None = None
@@ -1034,10 +1063,29 @@ def _find_oauth_node(data: object) -> dict | None:
     return None
 
 
+def _token_expired(config_dir: Path) -> bool:
+    """True if the on-disk credentials' expiresAt is in the past. Lets callers
+    skip a doomed poll_api() call against a token Anthropic will just 401
+    again, instead of discovering that reactively every poll cycle."""
+    cred_file = config_dir / ".credentials.json"
+    try:
+        blob = json.loads(cred_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    node = _find_oauth_node(blob)
+    expires_at = node.get("expiresAt") if node else None
+    if not isinstance(expires_at, (int, float)):
+        return False
+    return time.time() * 1000 >= expires_at
+
+
 async def refresh_oauth_token(config_dir: Path) -> str | None:
     """Exchange the on-disk refresh token for a fresh access token and write the
     rotated pair back to <config_dir>/.credentials.json. Returns the new access
     token, or None if there's nothing to refresh / the exchange failed."""
+    now = time.time()
+    if _refresh_backoff_until.get(config_dir, 0.0) > now:
+        return None
     cred_file = config_dir / ".credentials.json"
     try:
         blob = json.loads(cred_file.read_text(encoding="utf-8"))
@@ -1053,6 +1101,8 @@ async def refresh_oauth_token(config_dir: Path) -> str | None:
         "client_id": OAUTH_CLIENT_ID,
     }
     tok = None
+    rate_limited = False
+    backoff_s = _REFRESH_BACKOFF_DEFAULT
     for url in OAUTH_TOKEN_URLS:
         try:
             async with httpx.AsyncClient(timeout=20.0) as http:
@@ -1064,13 +1114,34 @@ async def refresh_oauth_token(config_dir: Path) -> str | None:
             continue
         if r.status_code == 404:
             continue
+        if r.status_code == 429:
+            # Rate limits are per-host -- try the other URL instead of giving
+            # up immediately, and only cool down if every host is limited.
+            rate_limited = True
+            retry_after = r.headers.get("retry-after", "")
+            if retry_after.isdigit():
+                backoff_s = max(backoff_s, int(retry_after))
+            log(f"Token refresh HTTP 429 ({url}): {r.text[:160]}")
+            continue
         if r.status_code != 200:
             log(f"Token refresh HTTP {r.status_code}: {r.text[:160]}")
             return None
         tok = r.json()
         break
     if not tok or "access_token" not in tok:
+        if rate_limited:
+            # Stop hammering the OAuth endpoint every poll cycle -- that just
+            # prolongs the rate limit instead of recovering from it. Grow the
+            # wait on each consecutive failure (capped) rather than retrying
+            # at the same flat cadence indefinitely.
+            streak = _refresh_fail_streak.get(config_dir, 0) + 1
+            _refresh_fail_streak[config_dir] = streak
+            backoff_s = min(backoff_s * (2 ** (streak - 1)), _REFRESH_BACKOFF_MAX)
+            _refresh_backoff_until[config_dir] = now + backoff_s
+            log(f"Token refresh rate-limited; backing off {backoff_s}s (streak {streak})")
         return None
+    _refresh_backoff_until.pop(config_dir, None)
+    _refresh_fail_streak.pop(config_dir, None)
 
     node["accessToken"] = tok["access_token"]
     if tok.get("refresh_token"):
@@ -1136,12 +1207,24 @@ async def poll_active_payload() -> dict | None:
     """Poll configured Claude config dirs and return the first valid payload.
 
     On a 401 from a file-based token, refresh it via the OAuth refresh token and
-    retry once — so usage keeps flowing even when `claude` hasn't run lately."""
+    retry once — so usage keeps flowing even when `claude` hasn't run lately.
+
+    If the on-disk token is already known-expired (checked client-side, no
+    network call), go straight to a (backoff-gated) refresh instead of
+    wasting a call on the main API with a token Anthropic will just 401 --
+    a real incident left this hitting the Messages API ~280 times over 5.5h
+    for nothing while every refresh attempt was itself rate-limited; see
+    CLAUDE.md."""
     env_token = _read_token_env()
     for cfg_dir in read_config_dirs():
         token = read_token_for(cfg_dir)
         if not token:
             continue
+        if not env_token and _token_expired(cfg_dir):
+            new_token = await refresh_oauth_token(cfg_dir)
+            if not new_token:
+                continue
+            token = new_token
         payload = await poll_api(token)
         if payload is not None:
             return payload
@@ -1223,27 +1306,69 @@ def remember_payload(payload: dict) -> None:
 
 
 async def resolve_device_ip() -> str | None:
-    """Resolve the device's IP, via an optional manual override first (config
-    key `device_host` -- a hostname or IP, for setups where OS-level mDNS
-    resolution isn't available, e.g. Linux without nss-mdns/avahi), else
-    mDNS resolution of DEVICE_HOSTNAME through the OS resolver."""
+    """Resolve the device's IP: an optional manual override first (config
+    key `device_host` -- a hostname or IP, for setups where neither
+    discovery mechanism below works), else mDNS resolution of
+    DEVICE_HOSTNAME through the OS resolver, else a UDP broadcast discovery
+    fallback (see _discover_broadcast_sync()) -- added after mDNS proved
+    unreliable on stock Windows (no Bonjour service = no ".local" resolver
+    at all, so getaddrinfo() fails fast rather than timing out -- trying it
+    first costs nothing even when it's going to fail)."""
     cfg = read_config()
     host = cfg.get("device_host", "").strip() or DEVICE_HOSTNAME
     log(f"Resolving '{host}'...")
     loop = asyncio.get_running_loop()
+    ip: str | None = None
     try:
         infos = await asyncio.wait_for(
             loop.getaddrinfo(host, 80, family=socket.AF_INET),
             timeout=RESOLVE_TIMEOUT,
         )
+        if infos:
+            ip = infos[0][4][0]
     except (OSError, asyncio.TimeoutError) as e:
         log(f"Resolve failed: {e}")
+
+    if ip:
+        log(f"Found: {ip}")
+        return ip
+
+    log("Trying UDP broadcast discovery...")
+    ip = await asyncio.to_thread(_discover_broadcast_sync)
+    if ip:
+        log(f"Found via broadcast discovery: {ip}")
+        return ip
+    log("Broadcast discovery found no device")
+    return None
+
+
+def _discover_broadcast_sync(timeout: float = DISCOVERY_TIMEOUT) -> str | None:
+    """Broadcasts one UDP discovery request and returns the IP of whichever
+    device replies with the expected magic string -- read off the reply
+    packet's source address, never parsed out of the payload itself (so
+    there's nothing in the payload to spoof). See firmware/src/discovery.h
+    for the device side of this protocol."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    deadline = time.monotonic() + timeout
+    try:
+        sock.sendto(DISCOVERY_REQUEST, ("255.255.255.255", DISCOVERY_PORT))
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            sock.settimeout(remaining)
+            try:
+                data, addr = sock.recvfrom(256)
+            except socket.timeout:
+                return None
+            if data.startswith(DISCOVERY_REPLY):
+                return addr[0]
+    except OSError as e:
+        log(f"Discovery broadcast failed: {e}")
         return None
-    if not infos:
-        return None
-    ip = infos[0][4][0]
-    log(f"Found: {ip}")
-    return ip
+    finally:
+        sock.close()
 
 
 async def poll_api(token: str) -> dict | None:
@@ -1411,6 +1536,11 @@ async def _poll_loop(session: Session, stop_event: asyncio.Event) -> bool:
     last_act_sent = 0.0
     last_ci_poll = 0.0
     last_sum_poll = 0.0
+    # Tracks the status frame the device is currently showing, so a recovered
+    # poll can clear a stuck "no token"/"API error" pill -- the device never
+    # clears daemon_state on its own, it only shows whatever status it was
+    # last told (see CLAUDE.md/ui.cpp's refresh_status_label()).
+    last_claude_state: str | None = None
 
     # Warm up cpu_percent so the first non-blocking call returns a real value
     try:
@@ -1429,8 +1559,12 @@ async def _poll_loop(session: Session, stop_event: asyncio.Event) -> bool:
                 state = "no_token" if not have_any_token() else "api_error"
                 log(f"No Claude payload; sending status={state}")
                 await session.write_payload(status_payload(state))
+                last_claude_state = state
             elif await session.write_payload(payload):
                 used_successfully = True
+                if last_claude_state != "ok":
+                    await session.write_payload(status_payload("ok"))
+                last_claude_state = "ok"
 
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=TICK)

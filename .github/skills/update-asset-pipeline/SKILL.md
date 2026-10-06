@@ -1,8 +1,8 @@
 ---
-description: "Add or regenerate Clawdmeter fonts, icons, pixel animations, or generated firmware assets with reproducible tooling and size checks."
-agent: "Firmware Orchestrator"
+name: update-asset-pipeline
+description: Add or regenerate Clawdmeter fonts, icons, pixel animations, or generated firmware assets with reproducible tooling and size checks.
+disable-model-invocation: true
 ---
-
 Handle this asset request:
 
 $ARGUMENTS

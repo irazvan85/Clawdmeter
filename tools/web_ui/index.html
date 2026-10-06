@@ -90,6 +90,23 @@
   }
   button:active { opacity: 0.8; }
   .stale { opacity: 0.4; }
+  .settings-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 4px 0;
+    font-size: 13px;
+  }
+  .settings-row input[type="checkbox"] { width: 16px; height: 16px; }
+  .hint { color: var(--dim); font-size: 11px; margin-top: 8px; }
+  select {
+    background: var(--bar-bg);
+    color: var(--text);
+    border: 1px solid var(--bar-bg);
+    border-radius: 6px;
+    padding: 6px 8px;
+    font-size: 13px;
+  }
 </style>
 </head>
 <body>
@@ -152,8 +169,45 @@
 
     <div class="card" style="grid-column: 1 / -1;">
       <h2>Screen</h2>
-      <img class="shot" id="shot" alt="device screenshot">
-      <button id="refresh-shot">Refresh screenshot</button>
+      <div id="shot-locked">
+        <div class="hint">Screenshot requires the auth token shown on the device's Connectivity screen.</div>
+        <button id="unlock-settings-shot">Unlock</button>
+      </div>
+      <div id="shot-body" style="display:none">
+        <img class="shot" id="shot" alt="device screenshot">
+        <button id="refresh-shot">Refresh screenshot</button>
+        <div class="settings-row">
+          <span class="k">Screen</span>
+          <select id="nav-screen"></select>
+          <button id="nav-go">Go</button>
+          <button id="nav-next">Next screen</button>
+        </div>
+        <div class="hint" id="nav-current"></div>
+      </div>
+    </div>
+
+    <div class="card" style="grid-column: 1 / -1;">
+      <h2>Settings</h2>
+      <div id="settings-locked">
+        <div class="hint">Settings require the auth token shown on the device's Connectivity screen.</div>
+        <button id="unlock-settings">Unlock settings</button>
+      </div>
+      <div id="settings-body" style="display:none">
+        <div class="settings-row">
+          <span class="k">Theme</span>
+          <select id="cfg-theme">
+            <option value="0">Default</option>
+            <option value="1">Slate</option>
+            <option value="2">Amber</option>
+          </select>
+        </div>
+        <div class="hint">Changing the theme restarts the device (~15s). Screens reappear as the daemon reports in.</div>
+        <div id="cfg-screens"></div>
+        <div class="hint">Clock and Connectivity are always shown &mdash; they can't be hidden.</div>
+        <button id="save-settings">Save settings</button>
+        <div class="hint" id="settings-status"></div>
+        <div class="hint">Token is remembered per-origin &mdash; re-enter it if you switch between an IP and clawdmeter.local.</div>
+      </div>
     </div>
   </div>
 
@@ -180,6 +234,10 @@ async function refreshState() {
   document.getElementById('conn-line').innerHTML =
     '<span class="dot ' + dotClass(conn.wifi_state) + '"></span>WiFi &middot; ' +
     (conn.wifi_ip ? conn.wifi_ip : 'no IP');
+  const navCurrent = document.getElementById('nav-current');
+  navCurrent.textContent = (typeof conn.screen === 'number' && SCREEN_NAMES[conn.screen])
+    ? ('Current: ' + SCREEN_NAMES[conn.screen])
+    : '';
 
   const c = d.claude || {};
   document.getElementById('claude-pct').textContent = fmtPct(c.session_pct);
@@ -223,14 +281,204 @@ async function refreshState() {
   document.getElementById('today-commits').textContent = t.valid ? t.commits : '--';
 }
 
-function refreshShot() {
-  document.getElementById('shot').src = '/api/screenshot.bmp?t=' + Date.now();
+// /api/screenshot.bmp is token-gated (it can render the Connectivity
+// screen's on-screen auth token, so it's protected the same as the other
+// mutating/sensitive routes) -- a plain <img src="..."> can't attach a
+// custom header, so fetch the bytes ourselves and hand the <img> a blob URL.
+let shotObjectUrl = null;
+async function refreshShot() {
+  const token = getToken();
+  if (!token) return;
+  try {
+    const r = await fetch('/api/screenshot.bmp?t=' + Date.now(), {
+      headers: { 'X-Auth-Token': token },
+    });
+    if (r.status === 401) {
+      clearToken();
+      updateLockUI();
+      return;
+    }
+    const blob = await r.blob();
+    const url = URL.createObjectURL(blob);
+    if (shotObjectUrl) URL.revokeObjectURL(shotObjectUrl);
+    shotObjectUrl = url;
+    document.getElementById('shot').src = url;
+  } catch (e) {
+    // Screenshot card just keeps its last frame; the rest of the dashboard
+    // doesn't depend on this.
+  }
 }
 
 document.getElementById('refresh-shot').addEventListener('click', refreshShot);
-refreshShot();
+
+// ---- Remote screen navigation ----
+// Index mirrors screen_t in firmware/src/ui.h (index == the enum value).
+// NOT the same indexing as CFG_SCREENS below -- that's bit positions in a
+// visibility mask, a different scheme entirely -- so a separate table is
+// required here, not a duplicate.
+const SCREEN_NAMES = [
+  'Splash', 'Clock', 'Sensor', 'Sensor Trend', 'Usage', 'Copilot',
+  'SysInfo', 'VS Code', 'Connectivity', 'Checks', 'Today', 'Aurora',
+];
+
+function populateScreenSelect() {
+  const sel = document.getElementById('nav-screen');
+  sel.innerHTML = '';
+  SCREEN_NAMES.forEach(function (name, idx) {
+    const opt = document.createElement('option');
+    opt.value = idx;
+    opt.textContent = name;
+    sel.appendChild(opt);
+  });
+}
+populateScreenSelect();
+
+// POST /api/screen -- the same remote-navigation action the physical
+// button already offers (jump to a screen / advance to the next one), just
+// over HTTP. Token-gated like every other mutating route.
+async function postScreen(body) {
+  const token = getToken();
+  if (!token) return;
+  try {
+    const r = await fetch('/api/screen', {
+      method: 'POST',
+      headers: { 'X-Auth-Token': token },
+      body: new URLSearchParams(body),
+    });
+    if (r.status === 401) {
+      clearToken();
+      updateLockUI();
+      return;
+    }
+    refreshState();
+    // Give the device a moment to finish redrawing before re-fetching the
+    // screenshot -- ui_show_screen() returns immediately, but the actual
+    // LVGL redraw happens on a later loop() tick.
+    setTimeout(refreshShot, 400);
+  } catch (e) {
+    // Nav controls just don't respond; the rest of the dashboard doesn't
+    // depend on this.
+  }
+}
+
+document.getElementById('nav-go').addEventListener('click', function () {
+  postScreen({ n: document.getElementById('nav-screen').value });
+});
+document.getElementById('nav-next').addEventListener('click', function () {
+  postScreen({ action: 'next' });
+});
+
 refreshState();
 setInterval(refreshState, 5000);
+
+// ---- Settings (theme + screen visibility) ----
+// Bit indices mirror firmware's CYCLE_ORDER[]/CFG_SCREEN_ORDER[] (see
+// device_config.cpp) -- bit 0 (Clock) and bit 8 (Connectivity) are always
+// forced on by the firmware, so they're intentionally not offered here.
+const CFG_SCREENS = [
+  { bit: 1, label: 'Aurora' },
+  { bit: 2, label: 'Sensor' },
+  { bit: 3, label: 'Sensor Trend' },
+  { bit: 4, label: 'Usage' },
+  { bit: 5, label: 'Copilot' },
+  { bit: 6, label: 'SysInfo' },
+  { bit: 7, label: 'VS Code' },
+  { bit: 9, label: 'Checks' },
+  { bit: 10, label: 'Today' },
+];
+
+// GET /api/state deliberately never exposes the auth token (it's an open
+// read) -- the token has to come from the device's Connectivity screen, the
+// same manual step the host daemon's own config file already requires.
+function getToken() { try { return localStorage.getItem('cm_token') || ''; } catch (e) { return ''; } }
+function setToken(t) { try { localStorage.setItem('cm_token', t); } catch (e) {} }
+function clearToken() { try { localStorage.removeItem('cm_token'); } catch (e) {} }
+
+function renderScreenCheckboxes(mask) {
+  const el = document.getElementById('cfg-screens');
+  el.innerHTML = '';
+  CFG_SCREENS.forEach(function (s) {
+    const row = document.createElement('label');
+    row.className = 'settings-row';
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.dataset.bit = s.bit;
+    cb.checked = (mask & (1 << s.bit)) !== 0;
+    row.appendChild(cb);
+    row.appendChild(document.createTextNode(s.label));
+    el.appendChild(row);
+  });
+}
+
+async function loadConfig() {
+  try {
+    const r = await fetch('/api/config');
+    const cfg = await r.json();
+    document.getElementById('cfg-theme').value = cfg.theme;
+    renderScreenCheckboxes(cfg.visible_mask);
+  } catch (e) {
+    // Settings card just stays on its last-known state; the rest of the
+    // dashboard doesn't depend on this.
+  }
+}
+
+function updateLockUI() {
+  const unlocked = !!getToken();
+  document.getElementById('settings-locked').style.display = unlocked ? 'none' : 'block';
+  document.getElementById('settings-body').style.display = unlocked ? 'block' : 'none';
+  document.getElementById('shot-locked').style.display = unlocked ? 'none' : 'block';
+  document.getElementById('shot-body').style.display = unlocked ? 'block' : 'none';
+}
+
+function promptForToken() {
+  const t = prompt("Auth token — shown on the device's Connectivity screen");
+  if (t && t.trim()) {
+    setToken(t.trim().toUpperCase());
+    updateLockUI();
+    loadConfig();
+    refreshShot();
+  }
+}
+
+document.getElementById('unlock-settings').addEventListener('click', promptForToken);
+document.getElementById('unlock-settings-shot').addEventListener('click', promptForToken);
+
+document.getElementById('save-settings').addEventListener('click', async function () {
+  const status = document.getElementById('settings-status');
+  let mask = 0;
+  document.querySelectorAll('#cfg-screens input[type=checkbox]').forEach(function (cb) {
+    if (cb.checked) mask |= (1 << Number(cb.dataset.bit));
+  });
+  const theme = document.getElementById('cfg-theme').value;
+  try {
+    const r = await fetch('/api/config', {
+      method: 'POST',
+      headers: { 'X-Auth-Token': getToken() },
+      body: new URLSearchParams({ theme: theme, mask: mask }),
+    });
+    if (r.status === 401) {
+      clearToken();
+      updateLockUI();
+      status.textContent = 'Token rejected — unlock again.';
+      return;
+    }
+    const res = await r.json();
+    if (res.restart) {
+      status.textContent = 'Saved — device restarting (~15s)...';
+    } else {
+      status.textContent = 'Saved.';
+      loadConfig();
+    }
+  } catch (e) {
+    status.textContent = 'Save failed — device unreachable.';
+  }
+});
+
+updateLockUI();
+if (getToken()) {
+  loadConfig();
+  refreshShot();
+}
 </script>
 </body>
 </html>

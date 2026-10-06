@@ -14,6 +14,8 @@
 #include "wifi_net.h"
 #include "web_server.h"
 #include "device_api.h"
+#include "device_config.h"
+#include "discovery.h"
 
 // Physical buttons:
 //   BTN_BACK  (GPIO 0 / BOOT) — cycle screens (splash→usage→bluetooth→usage…)
@@ -323,6 +325,7 @@ void build_state_json(JsonDocument& doc) {
     conn["daemon_state"] = ui_get_daemon_state();
     conn["wifi_state"]  = (int)wifi_get_state();
     conn["wifi_ip"]     = wifi_get_ip();
+    conn["screen"]      = (int)ui_get_current_screen();
 }
 
 bool device_ingest_payload(const char* raw) {
@@ -389,6 +392,30 @@ static void check_serial_cmd() {
                 // useful for scripted setup since it's generated once and
                 // persisted regardless of current WiFi state.
                 Serial.println(wifi_get_token());
+            } else if (strcmp(cmd_buf, "cfg") == 0) {
+                // QA helper: inspect the persisted theme/visibility-mask
+                // settings without needing WiFi/the web UI.
+                Serial.printf("theme=%u mask=0x%03X\n",
+                               device_config_get_theme(), device_config_get_visible_mask());
+            } else if (strncmp(cmd_buf, "cfg ", 4) == 0) {
+                // QA helper: "cfg <theme> <mask>" sets both directly, e.g.
+                // to exercise ui_cycle_screen()'s all-disabled-mask fallback
+                // (cfg 0 0) without going through the web UI/curl.
+                int t = 0, m = 0;
+                if (sscanf(cmd_buf + 4, "%d %d", &t, &m) == 2) {
+                    device_config_set_theme((uint8_t)t);
+                    device_config_set_visible_mask((uint16_t)m);
+                    Serial.printf("cfg -> theme=%u mask=0x%03X (restart to apply theme)\n",
+                                   device_config_get_theme(), device_config_get_visible_mask());
+                } else {
+                    Serial.println("usage: cfg <theme> <mask>");
+                }
+            } else if (strcmp(cmd_buf, "cycle") == 0) {
+                // QA helper: exercises ui_cycle_screen() (short-press's code
+                // path) without a physical button -- needed to verify the
+                // visibility-mask/watchdog-safety fix without a person here.
+                ui_cycle_screen();
+                Serial.printf("cycle -> %d\n", (int)ui_get_current_screen());
             } else if (strcmp(cmd_buf, "timer") == 0) {
                 ui_timer_toggle();
                 Serial.println("timer toggled");
@@ -445,6 +472,15 @@ void setup() {
     sensor_hist_init();
     usage_hist_init();
 
+    // Loads the persisted theme/visibility settings (Preferences NVS open,
+    // same class of call as the two just above) and sets g_theme -- must run
+    // before ui_init() (theme.h's macros read g_theme at widget-creation
+    // time) and before wifi_init_early() below, so this NVS open happens on
+    // the same pristine, unfragmented heap as the other proven-safe opens
+    // above rather than competing with wifi_init_early()'s heap-sensitive
+    // one-shot allocation (CLAUDE.md gotcha #14).
+    device_config_init();
+
     // Init LVGL
     lv_init();
     lv_tick_set_cb(my_tick);
@@ -489,6 +525,7 @@ void setup() {
     // why that has to be deferred).
     wifi_init();
     web_server_init();
+    discovery_init();
 
     Serial.println("Dashboard ready, waiting for data over WiFi or serial...");
 }
@@ -498,6 +535,7 @@ void loop() {
     ui_tick_anim();
     wifi_tick();
     web_server_tick();
+    discovery_tick();
     power_tick();
     imu_tick();
     env_sensor_tick();

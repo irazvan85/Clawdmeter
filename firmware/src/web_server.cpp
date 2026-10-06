@@ -6,6 +6,8 @@
 #include "display_cfg.h"
 #include "web_ui.h"
 #include "wifi_net.h"
+#include "device_config.h"
+#include "ui.h"
 
 static WebServer server(80);
 
@@ -38,6 +40,96 @@ static void handle_payload() {
     } else {
         server.send(400, "application/json", "{\"ok\":false}");
     }
+}
+
+// GET is open (labels/current values only, no secret) -- POST is the
+// mutating route, gated the same way handle_payload() is above.
+static void handle_config_get() {
+    JsonDocument doc;
+    doc["theme"] = device_config_get_theme();
+    doc["theme_count"] = THEME_PRESET_COUNT;
+    doc["visible_mask"] = device_config_get_visible_mask();
+    String out;
+    serializeJson(doc, out);
+    server.send(200, "application/json", out);
+}
+
+// Calling ESP.restart() directly from inside a handler would tear down the
+// socket before this response drains, so the browser would see a network
+// error even though the save succeeded -- restart_at_ms defers it a beat,
+// checked from web_server_tick() below.
+static uint32_t restart_at_ms = 0;
+
+// Form-encoded, not JSON: WebServer already parses
+// application/x-www-form-urlencoded into server.arg(), so this needs no
+// JsonDocument at all -- simpler and cheaper than mirroring handle_payload()'s
+// JSON body, and this payload is tiny/non-contiguous either way (nothing
+// like the ~65 KB screenshot allocation gotcha #15 is about).
+static void handle_config_post() {
+    if (server.header("X-Auth-Token") != wifi_get_token()) {
+        server.send(401, "text/plain", "bad token");
+        return;
+    }
+    if (server.arg("theme").length() > 4 || server.arg("mask").length() > 8) {
+        server.send(400, "text/plain", "bad request");
+        return;
+    }
+    bool restart = false;
+    if (server.hasArg("theme")) {
+        int want = server.arg("theme").toInt();
+        // Range-check here, not just inside device_config_set_theme() --
+        // that function already silently ignores an out-of-range index, but
+        // this handler needs to know whether anything actually happened so
+        // it doesn't report (and trigger) a restart for a rejected value.
+        if (want >= 0 && want < THEME_PRESET_COUNT && (uint8_t)want != device_config_get_theme()) {
+            device_config_set_theme((uint8_t)want);
+            restart = true;
+        }
+    }
+    if (server.hasArg("mask")) {
+        device_config_set_visible_mask((uint16_t)server.arg("mask").toInt());
+    }
+    JsonDocument doc;
+    doc["ok"] = true;
+    doc["restart"] = restart;
+    String out;
+    serializeJson(doc, out);
+    server.send(200, "application/json", out);
+    if (restart) restart_at_ms = millis() + 1500;
+}
+
+// Lets the web dashboard change what's on the device's screen remotely --
+// same two actions the physical button already offers (jump to a screen /
+// advance to the next one), just over HTTP instead of GPIO0. Token-gated
+// like every other mutating route; ui_show_screen() already redirects an
+// unpopulated/out-of-range screen to Clock and ui_cycle_screen() already
+// skips hidden/unpopulated screens, so this can't land on a null container
+// or defeat the visibility-mask settings (Phase 2) -- both guards are
+// reused as-is, nothing is duplicated here.
+static void handle_screen_post() {
+    if (server.header("X-Auth-Token") != wifi_get_token()) {
+        server.send(401, "text/plain", "bad token");
+        return;
+    }
+    if (server.hasArg("n")) {
+        int n = server.arg("n").toInt();
+        if (n < 0 || n >= SCREEN_COUNT) {
+            server.send(400, "text/plain", "bad screen index");
+            return;
+        }
+        ui_show_screen((screen_t)n);
+    } else if (server.hasArg("action") && server.arg("action") == "next") {
+        ui_cycle_screen();
+    } else {
+        server.send(400, "text/plain", "bad request");
+        return;
+    }
+    JsonDocument doc;
+    doc["ok"] = true;
+    doc["screen"] = (int)ui_get_current_screen();
+    String out;
+    serializeJson(doc, out);
+    server.send(200, "application/json", out);
 }
 
 static void write_le16(uint8_t* p, uint16_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); }
@@ -78,7 +170,19 @@ static void screenshot_tile_to_http(int x1, int y1, int x2, int y2, const uint16
 // comment in device_api.h) -- a single ~65 KB malloc() here used to fail
 // under real load ("out of memory"), since WiFi + an active daemon
 // connection are also holding heap.
+//
+// Token-gated like the other mutating/sensitive routes: the Connectivity
+// screen renders the auth token as on-screen text (ui.cpp's lbl_wifi_token),
+// and nothing prevents the device from sitting on that screen indefinitely
+// (there's no auto-return-to-Clock timeout) -- an unauthenticated screenshot
+// route would let anyone on the LAN read the token straight off the
+// rendered frame, defeating build_state_json()'s/the web UI's own contract
+// that the token is never exposed over an unauthenticated route.
 static void handle_screenshot() {
+    if (server.header("X-Auth-Token") != wifi_get_token()) {
+        server.send(401, "text/plain", "bad token");
+        return;
+    }
     const int w = LCD_WIDTH, h = LCD_HEIGHT;
     const int row_bytes = ((w * 3 + 3) / 4) * 4;  // BMP rows padded to a 4-byte boundary
     const uint32_t pixel_data_size = (uint32_t)row_bytes * (uint32_t)h;
@@ -122,6 +226,9 @@ void web_server_init(void) {
     server.on("/api/state", HTTP_GET, handle_state);
     server.on("/api/screenshot.bmp", HTTP_GET, handle_screenshot);
     server.on("/api/payload", HTTP_POST, handle_payload);
+    server.on("/api/config", HTTP_GET, handle_config_get);
+    server.on("/api/config", HTTP_POST, handle_config_post);
+    server.on("/api/screen", HTTP_POST, handle_screen_post);
 }
 
 void web_server_tick(void) {
@@ -137,4 +244,9 @@ void web_server_tick(void) {
         started = true;
     }
     server.handleClient();
+    // Deferred theme-change restart -- see handle_config_post()'s comment
+    // for why this can't happen inside the handler itself.
+    if (restart_at_ms && (int32_t)(millis() - restart_at_ms) >= 0) {
+        ESP.restart();
+    }
 }

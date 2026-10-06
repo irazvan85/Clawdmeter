@@ -1,8 +1,8 @@
 ---
-description: "Port or diagnose Clawdmeter hardware on the ESP32 1.14 ST7789 board while preserving BLE and daemon compatibility."
-agent: "Firmware Orchestrator"
+name: port-board
+description: Port or diagnose Clawdmeter hardware on the ESP32 1.14 ST7789 board while preserving BLE and daemon compatibility.
+disable-model-invocation: true
 ---
-
 Handle this board-port request:
 
 $ARGUMENTS

@@ -10,6 +10,7 @@
 #include "display_cfg.h"
 #include "sensor_hist.h"
 #include "usage_hist.h"
+#include "device_config.h"
 
 // Custom fonts (scaled for 135x240 1.14" IPS)
 LV_FONT_DECLARE(font_tiempos_34);
@@ -1589,6 +1590,16 @@ static bool screen_is_populated(screen_t s) {
     }
 }
 
+// Navigation-only predicate: has-data AND user-visible. Deliberately kept
+// separate from screen_is_populated() above, which ui_show_screen()'s
+// null-container guard also depends on -- that guard is about whether a
+// container pointer exists, not user preference, and must stay reachable via
+// the serial `screen <n>` QA command even for a screen the user has hidden.
+// Used only by ui_cycle_screen() and refresh_screen_dots().
+static bool screen_in_cycle(screen_t s) {
+    return screen_is_populated(s) && device_config_screen_enabled(s);
+}
+
 static void init_screen_dots(lv_obj_t* scr) {
     for (int i = 0; i < MAX_DOTS; i++) {
         lv_obj_t* d = lv_obj_create(scr);
@@ -1609,7 +1620,7 @@ static void refresh_screen_dots(screen_t screen) {
     int idx = -1, count = 0;
     if (screen != SCREEN_SPLASH) {
         for (unsigned i = 0; i < CYCLE_COUNT; i++) {
-            if (!screen_is_populated(CYCLE_ORDER[i])) continue;
+            if (!screen_in_cycle(CYCLE_ORDER[i])) continue;
             if (CYCLE_ORDER[i] == screen) idx = count;
             count++;
         }
@@ -2549,7 +2560,13 @@ void ui_show_screen(screen_t screen) {
 
 void ui_cycle_screen(void) {
     screen_t next = current_screen;
-    do {
+    // Bounded, not a bare while(true): with the visibility mask now ANDed
+    // in via screen_in_cycle(), a corrupt/adversarial mask could in
+    // principle disable every stop this loop would otherwise land on --
+    // device_config_set_visible_mask() forces Clock+Connectivity on to
+    // prevent that in practice, but this bound is defense-in-depth against
+    // an unbounded loop starving IDLE0 into a watchdog-reset reboot loop.
+    for (unsigned tries = 0; tries <= CYCLE_COUNT + 1; tries++) {
         if (next == SCREEN_CLOCK)          next = SCREEN_AURORA;
         else if (next == SCREEN_AURORA)    next = SCREEN_SENSOR;
         else if (next == SCREEN_SENSOR)    next = SCREEN_SENSOR_GRAPH;
@@ -2562,12 +2579,14 @@ void ui_cycle_screen(void) {
         else if (next == SCREEN_CI)        next = SCREEN_TODAY;
         else if (next == SCREEN_TODAY)     next = SCREEN_SPLASH;
         else                              next = SCREEN_CLOCK;  // from SPLASH (or first run)
-        // Skip screens that have never received data from the daemon so
-        // cycling only surfaces screens with real content.
-        if (!screen_is_populated(next)) continue;
-        break;
-    } while (true);
-    ui_show_screen(next);
+        // Skip screens that have never received data from the daemon, or
+        // that the user has hidden, so cycling only surfaces real content
+        // the user actually wants to see.
+        if (!screen_in_cycle(next)) continue;
+        ui_show_screen(next);
+        return;
+    }
+    ui_show_screen(SCREEN_CLOCK);  // fallback: nothing matched within bound
 }
 
 void ui_toggle_splash(void) {

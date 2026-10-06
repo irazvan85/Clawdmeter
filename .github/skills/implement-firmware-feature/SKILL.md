@@ -1,8 +1,8 @@
 ---
-description: "Implement a bounded Clawdmeter firmware feature with impact analysis, specialist delegation, focused validation, and documentation updates."
-agent: "Firmware Orchestrator"
+name: implement-firmware-feature
+description: Implement a bounded Clawdmeter firmware feature with impact analysis, specialist delegation, focused validation, and documentation updates.
+disable-model-invocation: true
 ---
-
 Implement this firmware feature:
 
 $ARGUMENTS
