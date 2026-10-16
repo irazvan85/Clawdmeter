@@ -25,7 +25,9 @@ function main() {
     process.exit(1);
   }
 
-  const html = fs.readFileSync(IN_FILE);
+  // Normalize CRLF -> LF so the generated header is byte-identical whether
+  // the page was checked out on Windows (core.autocrlf) or Linux/macOS.
+  const html = Buffer.from(fs.readFileSync(IN_FILE, 'utf8').replace(/\r\n/g, '\n'), 'utf8');
   const gz = zlib.gzipSync(html, { level: 9 });
 
   let out = '';

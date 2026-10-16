@@ -16,6 +16,7 @@
 #include "device_api.h"
 #include "device_config.h"
 #include "discovery.h"
+#include "perf.h"
 
 // Physical buttons:
 //   BTN_BACK  (GPIO 0 / BOOT) — cycle screens (splash→usage→bluetooth→usage…)
@@ -326,6 +327,10 @@ void build_state_json(JsonDocument& doc) {
     conn["wifi_state"]  = (int)wifi_get_state();
     conn["wifi_ip"]     = wifi_get_ip();
     conn["screen"]      = (int)ui_get_current_screen();
+
+    // Heap/loop-timing counters (perf.h) -- no secrets, safe on this
+    // unauthenticated route. tools/perf_check.py reads these.
+    perf_to_json(doc["device"].to<JsonObject>());
 }
 
 bool device_ingest_payload(const char* raw) {
@@ -416,6 +421,20 @@ static void check_serial_cmd() {
                 // visibility-mask/watchdog-safety fix without a person here.
                 ui_cycle_screen();
                 Serial.printf("cycle -> %d\n", (int)ui_get_current_screen());
+            } else if (strcmp(cmd_buf, "perf") == 0) {
+                // QA helper: one JSON line of runtime counters (perf.h),
+                // parsed by tools/perf_check.py. "perf reset" clears the
+                // window (avg/max) so a measurement covers just one action.
+                JsonDocument pd;
+                JsonObject po = pd["perf"].to<JsonObject>();
+                perf_to_json(po);
+                po["wifi_state"] = (int)wifi_get_state();   // wifi_state_t: 0 off .. 3 failed
+                po["wifi_ip"]    = wifi_get_ip();
+                serializeJson(pd, Serial);
+                Serial.println();
+            } else if (strcmp(cmd_buf, "perf reset") == 0) {
+                perf_reset();
+                Serial.println("perf reset");
             } else if (strcmp(cmd_buf, "timer") == 0) {
                 ui_timer_toggle();
                 Serial.println("timer toggled");
@@ -527,11 +546,15 @@ void setup() {
     web_server_init();
     discovery_init();
 
+    perf_reset();
     Serial.println("Dashboard ready, waiting for data over WiFi or serial...");
 }
 
 void loop() {
+    perf_loop_begin();
+    perf_lv_begin();
     lv_timer_handler();
+    perf_lv_end();
     ui_tick_anim();
     wifi_tick();
     web_server_tick();
@@ -654,5 +677,6 @@ void loop() {
     // Check for serial commands (screenshot, etc.)
     check_serial_cmd();
 
+    perf_loop_end();   // before delay(): measures work, not the idle sleep
     delay(5);
 }
