@@ -5,8 +5,17 @@ firmware/.vscode/
 # OS
 .DS_Store
 
-# Claude Code
-.claude/
+# Claude Code -- project skills/hooks/settings.json ARE versioned (they
+# encode the build/flash/QA workflow); only per-machine state is ignored.
+.claude/settings.local.json
+.claude/skills/graphify/
+.claude/worktrees/
+
+# graphify -- the graph is a local, regenerable index
+graphify-out/
+
+# Local screenshot captures (screenshots/*.png committed ones are docs)
+/screenshot.png
 
 # Node tooling deps (npm install --no-save)
 tools/node_modules/

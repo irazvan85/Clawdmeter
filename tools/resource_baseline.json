@@ -1,0 +1,7 @@
+{
+  "static_dram": 59844,
+  "iram": 86631,
+  "app_bin": 1675248,
+  "flash_text": 1103700,
+  "flash_rodata": 460036
+}

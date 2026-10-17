@@ -1,0 +1,17 @@
+# Keep the knowledge graph to first-party, current source.
+.venv/
+.venv-1/
+graphify-out/
+screenshots/
+screenshot.png
+firmware/.pio/
+# Stale (pre-BLE-removal) Copilot agent docs -- indexing them puts deleted
+# modules (ble.cpp, NimBLE) back into graph answers. Remove this line once
+# .github/ is rewritten.
+.github/
+# Generated, huge, no relationships worth graphing
+firmware/src/splash_animations.h
+firmware/src/web_ui.h
+firmware/src/icons.h
+firmware/src/logo.h
+firmware/src/font_*.c

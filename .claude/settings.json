@@ -1,0 +1,53 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash|Read|Glob|Grep",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python \"$CLAUDE_PROJECT_DIR/.claude/hooks/graphify_nudge.py\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python \"$CLAUDE_PROJECT_DIR/.claude/hooks/post_edit.py\"",
+            "timeout": 60
+          }
+        ]
+      }
+    ]
+  },
+  "enabledPlugins": {
+    "frontend-design@claude-plugins-official": true,
+    "superpowers@claude-plugins-official": true,
+    "skill-creator@claude-plugins-official": true,
+    "github@claude-plugins-official": true,
+    "claude-code-setup@claude-plugins-official": true,
+    "esp32-ai-agent-skill@anthropic-plugin-directory": true
+  },
+  "permissions": {
+    "allow": [
+      "Bash(python tools/preflight.py:*)",
+      "Bash(python tools/check_consistency.py:*)",
+      "Bash(python tools/check_auth_gated_routes.py:*)",
+      "Bash(python tools/check_web_ui_xss.py:*)",
+      "Bash(python tools/resource_report.py:*)",
+      "Bash(python tools/check_static_mem.py:*)",
+      "Bash(python -m unittest:*)",
+      "Bash(node tools/build_web_ui.js:*)",
+      "Bash(node tools/convert_to_c.js:*)",
+      "Bash(graphify query:*)",
+      "Bash(graphify explain:*)",
+      "Bash(graphify path:*)",
+      "Bash(graphify update:*)"
+    ]
+  }
+}
