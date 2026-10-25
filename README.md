@@ -78,11 +78,26 @@ a daemon error like `no token` when something's wrong. If the link goes quiet
 the "working" animation on the Claude screen stops, so a frozen number never
 looks live.
 
+### Codex usage
+
+The **Codex** page shows quota used and reset countdowns for the account's two
+reported windows (for example, five hours and seven days). The daemon uses your
+existing Codex ChatGPT sign-in through the local app-server, refreshes every minute,
+and marks old readings stale. Credentials stay on the host. Install/sign in to Codex
+once; optional `codex_path` and `codex_bucket` entries in the daemon config override
+executable discovery and the default `codex` quota bucket. Visibility is controlled
+by the dashboard's Codex checkbox.
+
+![Codex usage page](screenshots/codex.png)
+
 ### Checks &amp; Today
 
-**Checks** shows the latest CI run for the repo you're in (resolved from the
-open VS Code / Claude Code workspace), the git working-tree state, and how many
-PRs are waiting on your review — via `gh`, so run `gh auth login` once.
+**Checks** identifies failures and review requests by repository, PR number/title,
+branch/commit, workflow, and failing job/step when available. Up to four items
+rotate every eight seconds, with failures prioritized; long names scroll. The web
+dashboard provides PR and check links and indicates when more items were found.
+The active repo comes from the open VS Code / Claude Code workspace; local git
+status and review counts remain visible. Uses `gh`, so run `gh auth login` once.
 **Today** totals your Claude time, tokens, cost estimate, commits, and Copilot
 requests since local midnight. Both are skipped in the cycle until they have data.
 

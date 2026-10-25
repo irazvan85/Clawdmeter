@@ -21,7 +21,7 @@ static const theme_t THEME_PRESETS[THEME_PRESET_COUNT] = {
 static const screen_t CFG_SCREEN_ORDER[] = {
     SCREEN_CLOCK, SCREEN_AURORA, SCREEN_SENSOR, SCREEN_SENSOR_GRAPH, SCREEN_USAGE,
     SCREEN_COPILOT, SCREEN_SYSINFO, SCREEN_VSCODE, SCREEN_BLUETOOTH,
-    SCREEN_CI, SCREEN_TODAY,
+    SCREEN_CI, SCREEN_TODAY, SCREEN_CODEX,
 };
 #define CFG_SCREEN_COUNT (sizeof(CFG_SCREEN_ORDER) / sizeof(CFG_SCREEN_ORDER[0]))
 
@@ -45,6 +45,11 @@ void device_config_init(void) {
     if (p.begin(CFG_NVS_NS, false)) {
         theme_idx    = (uint8_t)p.getUChar("theme", 0);
         visible_mask = p.getUShort("vismask", DEFAULT_MASK);
+        if (p.getUChar("screenver", 0) < 1) {
+            visible_mask |= (1u << (CFG_SCREEN_COUNT - 1));
+            p.putUShort("vismask", visible_mask);
+            p.putUChar("screenver", 1);
+        }
         p.end();
     }
     if (theme_idx >= THEME_PRESET_COUNT) theme_idx = 0;

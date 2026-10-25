@@ -13,6 +13,16 @@ struct UsageData {
     bool valid;              // false until first successful parse
 };
 
+struct CodexData {
+    float pct[2];
+    int window_min[2];
+    long reset_at[2];
+    long sampled_at;
+    int sample_age;
+    char status[12], plan[24], bucket[32];
+    bool valid;
+};
+
 struct CopilotData {
     int premium_pct;          // 0-100, % of monthly premium requests USED, -1 if unavailable
     int premium_remaining;    // requests remaining this month, -1 if unavailable
@@ -45,8 +55,18 @@ struct VscodeData {
     bool valid;         // false until first successful parse
 };
 
+constexpr int CI_MAX_ITEMS = 4;
+
+struct CiItem {
+    char state[12];
+    char repo[80], title[96], branch[64], sha[9];
+    char workflow[80], job[80], step[80];
+    char url[192], pr_url[192];
+    int pr, age_min, failed;
+};
+
 struct CiData {
-    char state[10];    // "pass" | "fail" | "running" | "none"
+    char state[10];    // summary; CiItem also distinguishes review/changes/cancelled
     char wf[20];       // workflow name
     char branch[24];   // branch the run/repo is on
     int  age_min;      // minutes since the run finished/started; -1 unknown
@@ -55,6 +75,9 @@ struct CiData {
     int  dirty;        // changed files in the working tree; -1 unknown
     int  ahead, behind;
     bool conflict;
+    bool review_ok;
+    int item_count, total;
+    CiItem items[CI_MAX_ITEMS];
     bool valid;
 };
 

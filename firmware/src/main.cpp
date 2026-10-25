@@ -34,6 +34,7 @@ Arduino_ST7789  *gfx = new Arduino_ST7789(
     LCD_WIDTH, LCD_HEIGHT, 52, 40);
 
 static UsageData usage = {};
+static CodexData codex = {};
 static CopilotData copilot = {};
 static SysInfoData sysinfo = {};
 static VscodeData vscode = {};
@@ -115,7 +116,7 @@ bool capture_screenshot_streamed(screenshot_tile_cb cb) {
 // Dispatching is done at the call site in loop().
 
 // Serial command buffer
-#define CMD_BUF_SIZE 256
+#define CMD_BUF_SIZE 1024
 static char cmd_buf[CMD_BUF_SIZE];
 static int cmd_pos = 0;
 
@@ -142,6 +143,21 @@ static bool process_payload(const char* raw) {
     const char* src = doc["src"] | "claude";
     if (strcmp(src, "status") == 0) {
         ui_update_daemon_state(doc["state"] | "ok");
+    } else if (strcmp(src, "codex") == 0) {
+        codex.pct[0] = doc["p1"] | -1.0f;
+        codex.pct[1] = doc["p2"] | -1.0f;
+        codex.window_min[0] = doc["w1"] | 0;
+        codex.window_min[1] = doc["w2"] | 0;
+        codex.reset_at[0] = doc["r1"] | 0L;
+        codex.reset_at[1] = doc["r2"] | 0L;
+        codex.sampled_at = doc["ts"] | 0L;
+        codex.sample_age = doc["age"] | 0;
+        strlcpy(codex.status, doc["st"] | "unavailable", sizeof(codex.status));
+        strlcpy(codex.plan, doc["plan"] | "", sizeof(codex.plan));
+        strlcpy(codex.bucket, doc["bucket"] | "codex", sizeof(codex.bucket));
+        codex.valid = true;
+        doc.clear();
+        ui_update_codex(&codex);
     } else if (strcmp(src, "copilot") == 0) {
         copilot.premium_pct        = doc["pp"]  | -1;
         copilot.premium_remaining  = doc["pr"]  | -1;
@@ -184,7 +200,30 @@ static bool process_payload(const char* raw) {
         cid.ahead    = doc["ah"]  | 0;
         cid.behind   = doc["bh"]  | 0;
         cid.conflict = doc["cf"]  | false;
+        cid.review_ok = doc["review_ok"] | true;
+        cid.item_count = 0;
+        for (JsonObjectConst item : doc["items"].as<JsonArrayConst>()) {
+            if (cid.item_count >= CI_MAX_ITEMS) break;
+            CiItem& dst = cid.items[cid.item_count++];
+            strlcpy(dst.state, item["state"] | "none", sizeof(dst.state));
+            strlcpy(dst.repo, item["repo"] | "", sizeof(dst.repo));
+            strlcpy(dst.title, item["title"] | "", sizeof(dst.title));
+            strlcpy(dst.branch, item["branch"] | "", sizeof(dst.branch));
+            strlcpy(dst.sha, item["sha"] | "", sizeof(dst.sha));
+            strlcpy(dst.workflow, item["workflow"] | "", sizeof(dst.workflow));
+            strlcpy(dst.job, item["job"] | "", sizeof(dst.job));
+            strlcpy(dst.step, item["step"] | "", sizeof(dst.step));
+            strlcpy(dst.url, item["url"] | "", sizeof(dst.url));
+            strlcpy(dst.pr_url, item["pr_url"] | "", sizeof(dst.pr_url));
+            dst.pr = item["pr"] | 0;
+            dst.age_min = item["age"] | -1;
+            dst.failed = item["failed"] | 0;
+        }
+        cid.total = doc["total"] | cid.item_count;
         cid.valid = true;
+        // All fields are copied now. Free the larger Checks document before
+        // lazy LVGL creation/text allocation fragments these temporary blocks.
+        doc.clear();
         ui_update_ci(&cid);
     } else if (strcmp(src, "sum") == 0) {
         todayd.active_min = doc["am"]  | 0;
@@ -242,6 +281,19 @@ static bool process_payload(const char* raw) {
 // GET /api/state (web_server.cpp) — dump everything the device currently
 // holds, from the same structs process_payload() above populates.
 void build_state_json(JsonDocument& doc) {
+    JsonObject cx = doc["codex"].to<JsonObject>();
+    cx["p1"] = codex.pct[0];
+    cx["p2"] = codex.pct[1];
+    cx["w1"] = codex.window_min[0];
+    cx["w2"] = codex.window_min[1];
+    cx["r1"] = codex.reset_at[0];
+    cx["r2"] = codex.reset_at[1];
+    cx["ts"] = codex.sampled_at;
+    cx["age"] = codex.sample_age;
+    cx["st"] = codex.status;
+    cx["plan"] = codex.plan;
+    cx["bucket"] = codex.bucket;
+    cx["valid"] = codex.valid;
     JsonObject claude = doc["claude"].to<JsonObject>();
     claude["session_pct"]        = usage.session_pct;
     claude["session_reset_mins"] = usage.session_reset_mins;
@@ -312,6 +364,26 @@ void build_state_json(JsonDocument& doc) {
     ci["ahead"]    = cid.ahead;
     ci["behind"]   = cid.behind;
     ci["conflict"] = cid.conflict;
+    ci["review_ok"] = cid.review_ok;
+    ci["total"] = cid.total;
+    JsonArray ci_items = ci["items"].to<JsonArray>();
+    for (int i = 0; i < cid.item_count; ++i) {
+        const CiItem& src = cid.items[i];
+        JsonObject item = ci_items.add<JsonObject>();
+        item["state"] = src.state;
+        item["repo"] = src.repo;
+        item["title"] = src.title;
+        item["branch"] = src.branch;
+        item["sha"] = src.sha;
+        item["workflow"] = src.workflow;
+        item["job"] = src.job;
+        item["step"] = src.step;
+        item["url"] = src.url;
+        item["pr_url"] = src.pr_url;
+        item["pr"] = src.pr;
+        item["age"] = src.age_min;
+        item["failed"] = src.failed;
+    }
     ci["valid"]    = cid.valid;
 
     JsonObject today = doc["today"].to<JsonObject>();

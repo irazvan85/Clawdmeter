@@ -137,6 +137,9 @@
   button:disabled { opacity: 0.4; cursor: not-allowed; }
   button:focus-visible, select:focus-visible, input:focus-visible { outline: 2px solid var(--text); outline-offset: 3px; }
   .stale { opacity: 0.4; }
+  .check-item { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--bar-bg); overflow-wrap: anywhere; }
+  .check-item p { margin: 4px 0; }
+  .check-item a { color: var(--accent); margin-right: 12px; }
   .settings-row {
     display: flex;
     align-items: center;
@@ -194,6 +197,18 @@
       <div class="row"><span class="k">Weekly</span><span class="v" id="claude-weekly">--%</span></div>
       <div class="row"><span class="k">Model</span><span class="v" id="claude-model">--</span></div>
       <div class="row"><span class="k">Activity</span><span class="v" id="claude-act">--</span></div>
+    </div>
+
+    <div class="card">
+      <h2>Codex</h2>
+      <div class="row"><span class="k" id="codex-window-1">Primary</span><span class="v" id="codex-pct-1">--</span></div>
+      <div class="bar"><div id="codex-bar-1" style="width:0%"></div></div>
+      <p class="hint" id="codex-reset-1">--</p>
+      <div class="row"><span class="k" id="codex-window-2">Secondary</span><span class="v" id="codex-pct-2">--</span></div>
+      <div class="bar"><div id="codex-bar-2" style="width:0%"></div></div>
+      <p class="hint" id="codex-reset-2">--</p>
+      <div class="row"><span class="k">Plan</span><span class="v" id="codex-plan">--</span></div>
+      <p class="hint" id="codex-status">--</p>
     </div>
 
     <div class="card">
@@ -275,6 +290,23 @@ function dotClass(wifiState) {
 
 function fmtPct(v) { return (v === null || v === undefined || v < 0) ? '--' : Math.round(v) + '%'; }
 
+function quotaWindow(minutes, fallback) {
+  if (!minutes || minutes < 0) return fallback;
+  if (minutes % 1440 === 0) return (minutes / 1440) + 'd window';
+  if (minutes % 60 === 0) return (minutes / 60) + 'h window';
+  return minutes + 'm window';
+}
+
+function codexReset(pct, reset, now) {
+  if (pct === undefined || pct < 0) return 'No quota data';
+  if (!reset) return 'Reset time unavailable';
+  const minutes = Math.ceil((reset - now) / 60);
+  if (minutes <= 0) return 'Awaiting refresh';
+  if (minutes < 60) return 'Resets in ' + minutes + 'm';
+  if (minutes < 1440) return 'Resets in ' + Math.floor(minutes / 60) + 'h ' + (minutes % 60) + 'm';
+  return 'Resets in ' + Math.floor(minutes / 1440) + 'd ' + Math.floor((minutes % 1440) / 60) + 'h';
+}
+
 async function refreshState() {
   let d;
   try {
@@ -306,6 +338,24 @@ async function refreshState() {
   document.getElementById('claude-act').textContent = act.state || '--';
 
   const cp = d.copilot || {};
+  const cx = d.codex || {};
+  const quotaNow = Math.floor(Date.now() / 1000);
+  const quotaAge = cx.ts ? Math.max(0, quotaNow - cx.ts) : 0;
+  const quotaStale = cx.st === 'stale' || (cx.ts && quotaAge >= 180);
+  for (let i = 1; i <= 2; i++) {
+    const pct = cx.valid ? cx['p' + i] : -1;
+    document.getElementById('codex-pct-' + i).textContent = fmtPct(pct);
+    document.getElementById('codex-window-' + i).textContent = quotaWindow(cx['w' + i], i === 1 ? 'Primary' : 'Secondary');
+    const bar = document.getElementById('codex-bar-' + i);
+    bar.style.width = Math.max(0, Math.min(100, pct || 0)) + '%';
+    bar.style.background = quotaStale ? 'var(--dim)' : 'var(--accent)';
+    document.getElementById('codex-reset-' + i).textContent = codexReset(pct, cx['r' + i], quotaNow);
+  }
+  document.getElementById('codex-plan').textContent = cx.plan || '--';
+  document.getElementById('codex-status').textContent = !cx.valid ? 'Waiting for Codex' : quotaStale ?
+    'Stale · last update ' + Math.floor(quotaAge / 60) + 'm ago' : cx.st === 'ok' ?
+    'Updated ' + quotaAge + 's ago' : cx.st === 'sign_in' ? 'Sign in to Codex' :
+    cx.st === 'missing' ? 'Codex executable not found' : 'Quota unavailable';
   document.getElementById('copilot-pct').textContent = cp.valid ? fmtPct(cp.premium_pct) : '--%';
   document.getElementById('copilot-bar').style.width = Math.max(0, Math.min(100, cp.premium_pct || 0)) + '%';
   document.getElementById('copilot-plan').textContent = cp.plan || '--';
@@ -376,7 +426,7 @@ document.getElementById('refresh-shot').addEventListener('click', refreshShot);
 // required here, not a duplicate.
 const SCREEN_NAMES = [
   'Splash', 'Clock', 'Sensor', 'Sensor Trend', 'Usage', 'Copilot',
-  'SysInfo', 'VS Code', 'Connectivity', 'Checks', 'Today', 'Aurora',
+  'SysInfo', 'VS Code', 'Connectivity', 'Checks', 'Today', 'Aurora', 'Codex',
 ];
 
 function populateScreenMenu() {
@@ -443,6 +493,7 @@ const CFG_SCREENS = [
   { bit: 7, label: 'VS Code' },
   { bit: 9, label: 'Checks' },
   { bit: 10, label: 'Today' },
+  { bit: 11, label: 'Codex' },
 ];
 
 // GET /api/state deliberately never exposes the auth token (it's an open

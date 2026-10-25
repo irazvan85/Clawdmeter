@@ -480,7 +480,7 @@ static void make_usage_panel(lv_obj_t* parent, int y, const char* pill_text,
     // that with room to spare. Deliberately not the green/amber/red status
     // palette (the bar above already carries that signal) — a neutral trace
     // color so the two aren't read as disagreeing.
-    make_usage_spark(panel, spark_col, out_spark);
+    if (out_spark) make_usage_spark(panel, spark_col, out_spark);
 }
 
 // Copilot panel: 60px tall (bar at y=22, detail label at y=36).
@@ -537,6 +537,88 @@ static void init_usage_screen(lv_obj_t* scr) {
     lv_label_set_long_mode(lbl_anim, LV_LABEL_LONG_DOT);
     lv_obj_set_style_text_align(lbl_anim, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_align(lbl_anim, LV_ALIGN_BOTTOM_MID, 0, -8);
+}
+
+// ======== Codex quotas (same panels, no history allocation) ========
+
+static lv_obj_t* codex_container;
+static lv_obj_t* codex_pct[2];
+static lv_obj_t* codex_window[2];
+static lv_obj_t* codex_bar[2];
+static lv_obj_t* codex_reset[2];
+static lv_obj_t* lbl_codex_plan;
+static lv_obj_t* lbl_codex_status;
+static const CodexData* codex_data = nullptr;
+static uint32_t codex_rx_ms;
+static bool codex_has_data = false;
+
+static void init_codex_screen(lv_obj_t* scr) {
+    codex_container = make_screen_container(scr, "Codex");
+    lbl_codex_plan = lv_label_create(codex_container);
+    lv_obj_set_pos(lbl_codex_plan, MARGIN, 28);
+    lv_obj_set_width(lbl_codex_plan, CONTENT_W);
+    lv_label_set_long_mode(lbl_codex_plan, LV_LABEL_LONG_CLIP);
+    lv_obj_set_style_text_font(lbl_codex_plan, &font_styrene_12, 0);
+    lv_obj_set_style_text_color(lbl_codex_plan, COL_DIM, 0);
+    for (int i = 0; i < 2; ++i) {
+        make_usage_panel(codex_container, CONTENT_Y + i * (PANEL_H + PANEL_GAP),
+                         i ? "Long" : "Short", COL_ACCENT, &codex_pct[i],
+                         &codex_window[i], &codex_bar[i], &codex_reset[i], nullptr);
+    }
+    lbl_codex_status = lv_label_create(codex_container);
+    lv_obj_set_pos(lbl_codex_status, MARGIN, 214);
+    lv_obj_set_width(lbl_codex_status, CONTENT_W);
+    lv_obj_set_style_text_font(lbl_codex_status, &font_styrene_12, 0);
+    lv_obj_set_style_text_color(lbl_codex_status, COL_DIM, 0);
+    lv_obj_add_flag(codex_container, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void refresh_codex() {
+    if (!codex_data || !codex_container) return;
+    const CodexData& data = *codex_data;
+    uint32_t elapsed = (lv_tick_get() - codex_rx_ms) / 1000;
+    long age = (data.sample_age > 0 ? data.sample_age : 0) + (long)elapsed;
+    long now = data.sampled_at + age;
+    bool stale = strcmp(data.status, "stale") == 0 || (data.sampled_at > 0 && age >= 180);
+    lv_label_set_text(lbl_codex_plan, data.plan[0] ? data.plan : data.bucket);
+    char b[40];
+    for (int i = 0; i < 2; ++i) {
+        int duration = data.window_min[i];
+        if (duration > 0 && duration % 1440 == 0) snprintf(b, sizeof(b), "%dd", duration / 1440);
+        else if (duration > 0 && duration % 60 == 0) snprintf(b, sizeof(b), "%dh", duration / 60);
+        else if (duration > 0) snprintf(b, sizeof(b), "%dm", duration);
+        else snprintf(b, sizeof(b), "%s", i ? "Long" : "Short");
+        lv_label_set_text(codex_window[i], b);
+        bool known = isfinite(data.pct[i]) && data.pct[i] >= 0 && data.pct[i] <= 100;
+        int pct = known ? (int)roundf(data.pct[i]) : 0;
+        if (known) lv_label_set_text_fmt(codex_pct[i], "%d%%", pct);
+        else lv_label_set_text(codex_pct[i], "---%");
+        lv_bar_set_value(codex_bar[i], pct, LV_ANIM_OFF);
+        lv_obj_set_style_bg_color(codex_bar[i], known && !stale ? pct_color(pct) : COL_DIM, LV_PART_INDICATOR);
+        if (!known) snprintf(b, sizeof(b), "No quota data");
+        else if (!data.reset_at[i] || !data.sampled_at) snprintf(b, sizeof(b), "Reset unknown");
+        else if (data.reset_at[i] <= now) snprintf(b, sizeof(b), "Awaiting refresh");
+        else format_reset_time((data.reset_at[i] - now + 59) / 60, b, sizeof(b));
+        lv_label_set_text(codex_reset[i], b);
+    }
+    if (stale) snprintf(b, sizeof(b), "Stale %ldm", age / 60);
+    else if (!strcmp(data.status, "sign_in")) snprintf(b, sizeof(b), "Sign in to Codex");
+    else if (!strcmp(data.status, "missing")) snprintf(b, sizeof(b), "Codex not found");
+    else if (strcmp(data.status, "ok")) snprintf(b, sizeof(b), "Quota unavailable");
+    else if (age < 60) snprintf(b, sizeof(b), "Updated %lds ago", age);
+    else snprintf(b, sizeof(b), "Updated %ldm ago", age / 60);
+    lv_label_set_text(lbl_codex_status, b);
+    lv_obj_set_style_text_color(lbl_codex_status, stale ? COL_AMBER : COL_DIM, 0);
+}
+
+void ui_update_codex(const CodexData* data) {
+    if (!data->valid) return;
+    if (!codex_has_data) init_codex_screen(lv_screen_active());
+    codex_has_data = true;
+    codex_data = data;
+    codex_rx_ms = lv_tick_get();
+    note_data();
+    refresh_codex();
 }
 
 // ======== Copilot Screen (135x240) ========
@@ -1093,91 +1175,109 @@ static void init_bluetooth_screen(lv_obj_t* scr) {
 // ======== Checks Screen (CI + review queue + git) ========
 
 static lv_obj_t* ci_container;
-static lv_obj_t* ci_dot;
 static lv_obj_t* lbl_ci_state;
-static lv_obj_t* lbl_ci_wf;
-static lv_obj_t* lbl_ci_pr;
-static lv_obj_t* dot_ci_branch;    // small marker before the branch name — a
-                                    // visual anchor so the git row isn't just
-                                    // a wall of abbreviated text
+static lv_obj_t* lbl_ci_page;
+static lv_obj_t* lbl_ci_repo;
+static lv_obj_t* lbl_ci_identity;
+static lv_obj_t* lbl_ci_title;
+static lv_obj_t* lbl_ci_workflow;
+static lv_obj_t* lbl_ci_job;
+static lv_obj_t* lbl_ci_step;
 static lv_obj_t* lbl_ci_branch;
-static lv_obj_t* pill_ci_dirty;    // "N chg", amber, hidden when clean
-static lv_obj_t* pill_ci_ahead;    // "+N", green, hidden when 0
-static lv_obj_t* pill_ci_behind;   // "-N", dim, hidden when 0
+static lv_obj_t* lbl_ci_footer;
 static bool ci_has_data = false;
+// main.cpp owns this stable struct; avoid duplicating the bounded item array.
+static const CiData* ci_data = nullptr;
+static int ci_page = 0;
+static uint32_t ci_page_ms = 0;
+
+static lv_obj_t* ci_label(int y, const lv_font_t* font, int height = 16) {
+    lv_obj_t* label = lv_label_create(ci_container);
+    lv_obj_set_pos(label, MARGIN, y);
+    lv_obj_set_size(label, CONTENT_W, height);
+    lv_label_set_text(label, "");
+    lv_obj_set_style_text_font(label, font, 0);
+    lv_obj_set_style_text_color(label, COL_DIM, 0);
+    lv_label_set_long_mode(label, height > 20 ? LV_LABEL_LONG_DOT : LV_LABEL_LONG_SCROLL_CIRCULAR);
+    lv_obj_set_style_anim_duration(label, 5500, 0);
+    return label;
+}
 
 static void init_ci_screen(lv_obj_t* scr) {
     ci_container = make_screen_container(scr, "Checks");
-
-    ci_dot = lv_obj_create(ci_container);
-    lv_obj_set_size(ci_dot, 24, 24);
-    lv_obj_set_style_radius(ci_dot, LV_RADIUS_CIRCLE, 0);
-    lv_obj_set_style_border_width(ci_dot, 0, 0);
-    lv_obj_set_style_bg_color(ci_dot, COL_DIM, 0);
-    lv_obj_set_style_bg_opa(ci_dot, LV_OPA_COVER, 0);
-    lv_obj_clear_flag(ci_dot, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_pos(ci_dot, MARGIN + 4, CONTENT_Y + 4);
-
-    lbl_ci_state = lv_label_create(ci_container);
-    lv_label_set_text(lbl_ci_state, "No runs");
-    lv_obj_set_style_text_font(lbl_ci_state, &font_styrene_24, 0);
-    lv_obj_set_style_text_color(lbl_ci_state, COL_TEXT, 0);
-    lv_obj_set_pos(lbl_ci_state, MARGIN + 38, CONTENT_Y);
-
-    lbl_ci_wf = lv_label_create(ci_container);
-    lv_label_set_text(lbl_ci_wf, "");
-    lv_obj_set_style_text_font(lbl_ci_wf, &font_styrene_12, 0);
-    lv_obj_set_style_text_color(lbl_ci_wf, COL_DIM, 0);
-    lv_obj_set_pos(lbl_ci_wf, MARGIN + 38, CONTENT_Y + 26);
-
-    lv_obj_t* rule = lv_obj_create(ci_container);
-    lv_obj_set_size(rule, CONTENT_W - 24, 2);
-    lv_obj_align(rule, LV_ALIGN_TOP_MID, 0, CONTENT_Y + 52);
-    lv_obj_set_style_bg_color(rule, COL_BAR_BG, 0);
-    lv_obj_set_style_bg_opa(rule, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_width(rule, 0, 0);
-    lv_obj_set_style_radius(rule, 0, 0);
-    lv_obj_clear_flag(rule, LV_OBJ_FLAG_SCROLLABLE);
-
-    lbl_ci_pr = lv_label_create(ci_container);
-    lv_label_set_text(lbl_ci_pr, "");
-    lv_obj_set_style_text_font(lbl_ci_pr, &font_styrene_14, 0);
-    lv_obj_set_style_text_color(lbl_ci_pr, COL_TEXT, 0);
-    lv_obj_set_pos(lbl_ci_pr, MARGIN, CONTENT_Y + 66);
-
-    // Git working-tree row: a small marker + branch name, then compact
-    // status chips below — replaces one dense "main 4 chg +1 -0" line with
-    // scannable, color-coded pieces (dirty=amber, ahead=green, behind=dim).
-    dot_ci_branch = lv_obj_create(ci_container);
-    lv_obj_set_size(dot_ci_branch, 6, 6);
-    lv_obj_set_style_radius(dot_ci_branch, LV_RADIUS_CIRCLE, 0);
-    lv_obj_set_style_border_width(dot_ci_branch, 0, 0);
-    lv_obj_set_style_bg_color(dot_ci_branch, COL_DIM, 0);
-    lv_obj_set_style_bg_opa(dot_ci_branch, LV_OPA_COVER, 0);
-    lv_obj_clear_flag(dot_ci_branch, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_pos(dot_ci_branch, MARGIN + 1, CONTENT_Y + 96);
-
-    lbl_ci_branch = lv_label_create(ci_container);
-    lv_label_set_text(lbl_ci_branch, "");
-    lv_obj_set_style_text_font(lbl_ci_branch, &font_styrene_12, 0);
-    lv_obj_set_style_text_color(lbl_ci_branch, COL_TEXT, 0);
-    lv_obj_set_pos(lbl_ci_branch, MARGIN + 13, CONTENT_Y + 92);
-
-    // Fixed 42px chip slots — a hidden chip just leaves a gap, which reads
-    // fine for a status row (same idiom as CI check badges elsewhere).
-    pill_ci_dirty = make_pill(ci_container, "");
-    lv_obj_set_pos(pill_ci_dirty, MARGIN, CONTENT_Y + 112);
-    lv_obj_add_flag(pill_ci_dirty, LV_OBJ_FLAG_HIDDEN);
-
-    pill_ci_ahead = make_pill(ci_container, "");
-    lv_obj_set_pos(pill_ci_ahead, MARGIN + 42, CONTENT_Y + 112);
-    lv_obj_add_flag(pill_ci_ahead, LV_OBJ_FLAG_HIDDEN);
-
-    pill_ci_behind = make_pill(ci_container, "");
-    lv_obj_set_pos(pill_ci_behind, MARGIN + 84, CONTENT_Y + 112);
-    lv_obj_add_flag(pill_ci_behind, LV_OBJ_FLAG_HIDDEN);
-
+    lbl_ci_state = ci_label(40, &font_styrene_16, 22);
+    lv_obj_set_width(lbl_ci_state, 87);
+    lbl_ci_page = ci_label(43, &font_styrene_12);
+    lv_obj_set_pos(lbl_ci_page, 96, 43);
+    lv_obj_set_width(lbl_ci_page, 33);
+    lv_obj_set_style_text_align(lbl_ci_page, LV_TEXT_ALIGN_RIGHT, 0);
+    lbl_ci_repo = ci_label(64, &font_styrene_12);
+    lbl_ci_identity = ci_label(82, &font_styrene_16, 22);
+    lbl_ci_title = ci_label(105, &font_styrene_12, 30);
+    lv_label_set_long_mode(lbl_ci_title, LV_LABEL_LONG_WRAP);
+    lbl_ci_workflow = ci_label(140, &font_styrene_12);
+    lbl_ci_job = ci_label(158, &font_styrene_12);
+    lbl_ci_step = ci_label(176, &font_styrene_12);
+    lbl_ci_branch = ci_label(196, &font_styrene_12);
+    lbl_ci_footer = ci_label(216, &font_styrene_12);
+    lv_obj_set_style_text_color(lbl_ci_identity, COL_TEXT, 0);
+    lv_obj_set_style_text_color(lbl_ci_title, COL_TEXT, 0);
+    lv_obj_set_style_text_color(lbl_ci_job, COL_TEXT, 0);
     lv_obj_add_flag(ci_container, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void render_ci_page() {
+    if (!ci_data || !ci_container) return;
+    const CiData& data = *ci_data;
+    const CiItem* item = data.item_count ? &data.items[ci_page % data.item_count] : nullptr;
+    const char* state = item ? item->state : data.state;
+    const char* title = "No runs";
+    lv_color_t color = COL_DIM;
+    if (!strcmp(state, "fail")) { title = "Failed"; color = COL_RED; }
+    else if (!strcmp(state, "pass")) { title = "Passing"; color = COL_GREEN; }
+    else if (!strcmp(state, "running")) { title = "Running"; color = COL_AMBER; }
+    else if (!strcmp(state, "cancelled")) { title = "Cancelled"; color = COL_AMBER; }
+    else if (!strcmp(state, "changes")) { title = "Changes"; color = COL_AMBER; }
+    else if (!strcmp(state, "review")) { title = "Review"; color = COL_ACCENT; }
+    else if (!strcmp(state, "unknown")) title = "Unavailable";
+    lv_label_set_text(lbl_ci_state, title);
+    lv_obj_set_style_text_color(lbl_ci_state, color, 0);
+    char b[160];
+    if (item) snprintf(b, sizeof(b), "%d/%d%s", ci_page + 1, data.item_count, data.total > data.item_count ? "+" : "");
+    else b[0] = '\0';
+    lv_label_set_text(lbl_ci_page, b);
+    lv_label_set_text(lbl_ci_repo, item ? item->repo : "");
+    if (item && item->pr > 0) snprintf(b, sizeof(b), "PR #%d", item->pr);
+    else snprintf(b, sizeof(b), "%s", !strcmp(state, "unknown") ? "GitHub / gh" : "Branch run");
+    lv_label_set_text(lbl_ci_identity, b);
+    lv_label_set_text(lbl_ci_title, item ? item->title : data.wf);
+    lv_label_set_text(lbl_ci_workflow, item ? item->workflow : "");
+    lv_label_set_text(lbl_ci_job, item ? item->job : "");
+    if (item && item->step[0]) snprintf(b, sizeof(b), "Step: %s", item->step);
+    else if (item && item->age_min >= 0) {
+        if (item->age_min < 60) snprintf(b, sizeof(b), "%dm ago", item->age_min);
+        else snprintf(b, sizeof(b), "%dh ago", item->age_min / 60);
+    } else snprintf(b, sizeof(b), "%s", !strcmp(state, "unknown") ? "Check login / access" : "");
+    lv_label_set_text(lbl_ci_step, b);
+    const char* branch = item ? item->branch : data.branch;
+    snprintf(b, sizeof(b), "%s%s%s", branch[0] ? branch : "", item && item->sha[0] ? " / " : "", item ? item->sha : "");
+    lv_label_set_text(lbl_ci_branch, b);
+    b[0] = '\0';
+    if (item && item->failed > 0) {
+        snprintf(b, sizeof(b), "%d failed | ", item->failed);
+    }
+    size_t used = strlen(b);
+    if (item && item->age_min >= 0) {
+        snprintf(b + used, sizeof(b) - used, "%dm ago | ", item->age_min);
+        used = strlen(b);
+    }
+    if (data.review_ok) snprintf(b + used, sizeof(b) - used, "%d review | %d need work", data.review, data.changes);
+    else snprintf(b + used, sizeof(b) - used, "Review unavailable");
+    used = strlen(b);
+    if (data.conflict) snprintf(b + used, sizeof(b) - used, " | CONFLICT");
+    else if (data.dirty > 0 || data.ahead > 0 || data.behind > 0)
+        snprintf(b + used, sizeof(b) - used, " | local %d chg +%d -%d", data.dirty > 0 ? data.dirty : 0, data.ahead, data.behind);
+    lv_label_set_text(lbl_ci_footer, b);
 }
 
 // ======== Today Screen (daily summary) ========
@@ -1573,7 +1673,7 @@ static uint32_t  dots_hide_ms = 0;   // 0 = not pending
 static const screen_t CYCLE_ORDER[] = {
     SCREEN_CLOCK, SCREEN_AURORA, SCREEN_SENSOR, SCREEN_SENSOR_GRAPH, SCREEN_USAGE,
     SCREEN_COPILOT, SCREEN_SYSINFO, SCREEN_VSCODE, SCREEN_BLUETOOTH,
-    SCREEN_CI, SCREEN_TODAY,
+    SCREEN_CI, SCREEN_TODAY, SCREEN_CODEX,
 };
 #define CYCLE_COUNT (sizeof(CYCLE_ORDER) / sizeof(CYCLE_ORDER[0]))
 
@@ -1582,6 +1682,7 @@ static bool screen_is_populated(screen_t s) {
     case SCREEN_SYSINFO:      return sysinfo_has_data;
     case SCREEN_VSCODE:       return vscode_has_data;
     case SCREEN_CI:           return ci_has_data;
+    case SCREEN_CODEX:        return codex_has_data;
     case SCREEN_TODAY:        return today_has_data;
     case SCREEN_AURORA:       return aurora_has_data;
     case SCREEN_SENSOR:
@@ -2093,79 +2194,22 @@ void ui_update_ci(const CiData* data) {
     note_data();
     if (!ci_has_data) init_ci_screen(lv_screen_active());
     ci_has_data = true;
+    ci_data = data;
+    ci_page = 0;
+    ci_page_ms = lv_tick_get();
+    render_ci_page();
 
-    lv_color_t dc; const char* st;
     bool failing = strcmp(data->state, "fail") == 0;
-    if      (strcmp(data->state, "pass") == 0)    { dc = COL_GREEN; st = "Passing"; }
-    else if (failing)                             { dc = COL_RED;   st = "Failing"; }
-    else if (strcmp(data->state, "running") == 0) { dc = COL_AMBER; st = "Running"; }
-    else                                          { dc = COL_DIM;   st = "No runs"; }
-    lv_obj_set_style_bg_color(ci_dot, dc, 0);
-    lv_label_set_text(lbl_ci_state, st);
-
-    // Surface a fresh CI failure even if the Checks screen isn't the one on
-    // screen right now; clears itself once CI recovers.
+    for (int i = 0; i < data->item_count; ++i)
+        failing |= strcmp(data->items[i].state, "fail") == 0;
     static bool ci_alert_armed = false;
     if (failing && !ci_alert_armed) {
         ci_alert_armed = true;
-        banner_show(BANNER_ALERT, "CI is failing", COL_RED, COL_TEXT, 0);
+        if (current_screen != SCREEN_CI)
+            banner_show(BANNER_ALERT, "CI is failing", COL_RED, COL_TEXT, 0);
     } else if (!failing && ci_alert_armed) {
         ci_alert_armed = false;
         banner_clear(BANNER_ALERT);
-    }
-
-    char b[48];
-    if (data->wf[0] && data->age_min >= 0) {
-        if (data->age_min < 60) snprintf(b, sizeof(b), "%.14s - %dm ago", data->wf, data->age_min);
-        else                    snprintf(b, sizeof(b), "%.14s - %dh ago", data->wf, data->age_min / 60);
-    } else if (data->wf[0]) {
-        snprintf(b, sizeof(b), "%.16s", data->wf);
-    } else {
-        b[0] = '\0';
-    }
-    lv_label_set_text(lbl_ci_wf, b);
-
-    if (data->review > 0 && data->changes > 0)
-        snprintf(b, sizeof(b), "%d review  %d chg", data->review, data->changes);
-    else if (data->review > 0)
-        snprintf(b, sizeof(b), "%d to review", data->review);
-    else if (data->changes > 0)
-        snprintf(b, sizeof(b), "%d need work", data->changes);
-    else
-        snprintf(b, sizeof(b), "queue clear");
-    lv_label_set_text(lbl_ci_pr, b);
-    lv_obj_set_style_text_color(lbl_ci_pr, data->changes > 0 ? COL_AMBER : COL_TEXT, 0);
-
-    // Git working tree: marker + branch name, then dirty/ahead/behind chips.
-    // A conflict recolors the marker instead of adding a fourth chip — rare
-    // enough not to need its own slot.
-    snprintf(b, sizeof(b), "%.20s", data->branch[0] ? data->branch : "-");
-    lv_label_set_text(lbl_ci_branch, b);
-    lv_obj_set_style_bg_color(dot_ci_branch, data->conflict ? COL_RED : COL_DIM, 0);
-
-    if (data->dirty > 0) {
-        lv_label_set_text_fmt(pill_ci_dirty, "%d chg", data->dirty);
-        lv_obj_set_style_bg_color(pill_ci_dirty, COL_AMBER, 0);
-        lv_obj_set_style_text_color(pill_ci_dirty, COL_BG, 0);
-        lv_obj_clear_flag(pill_ci_dirty, LV_OBJ_FLAG_HIDDEN);
-    } else {
-        lv_obj_add_flag(pill_ci_dirty, LV_OBJ_FLAG_HIDDEN);
-    }
-    if (data->ahead > 0) {
-        lv_label_set_text_fmt(pill_ci_ahead, "+%d", data->ahead);
-        lv_obj_set_style_bg_color(pill_ci_ahead, COL_GREEN, 0);
-        lv_obj_set_style_text_color(pill_ci_ahead, COL_BG, 0);
-        lv_obj_clear_flag(pill_ci_ahead, LV_OBJ_FLAG_HIDDEN);
-    } else {
-        lv_obj_add_flag(pill_ci_ahead, LV_OBJ_FLAG_HIDDEN);
-    }
-    if (data->behind > 0) {
-        lv_label_set_text_fmt(pill_ci_behind, "-%d", data->behind);
-        lv_obj_set_style_bg_color(pill_ci_behind, COL_BAR_BG, 0);
-        lv_obj_set_style_text_color(pill_ci_behind, COL_DIM, 0);
-        lv_obj_clear_flag(pill_ci_behind, LV_OBJ_FLAG_HIDDEN);
-    } else {
-        lv_obj_add_flag(pill_ci_behind, LV_OBJ_FLAG_HIDDEN);
     }
 }
 
@@ -2405,6 +2449,14 @@ void ui_tick_anim(void) {
         refresh_status_label();
         timer_tick();  // runs on any screen so the break banner still fires
         if (current_screen == SCREEN_CLOCK) refresh_clock(false);
+        if (current_screen == SCREEN_CODEX) refresh_codex();
+    }
+
+    if (current_screen == SCREEN_CI && ci_data && ci_data->item_count > 1 &&
+        now - ci_page_ms >= 8000) {
+        ci_page = (ci_page + 1) % ci_data->item_count;
+        ci_page_ms = now;
+        render_ci_page();
     }
 
     // Trend graphs advance on a 15-minute cadence, so a slow refresh is
@@ -2510,6 +2562,7 @@ void ui_show_screen(screen_t screen) {
     if (sysinfo_container)  lv_obj_add_flag(sysinfo_container, LV_OBJ_FLAG_HIDDEN);
     if (vscode_container)   lv_obj_add_flag(vscode_container, LV_OBJ_FLAG_HIDDEN);
     if (ci_container)       lv_obj_add_flag(ci_container, LV_OBJ_FLAG_HIDDEN);
+    if (codex_container)    lv_obj_add_flag(codex_container, LV_OBJ_FLAG_HIDDEN);
     if (today_container)    lv_obj_add_flag(today_container, LV_OBJ_FLAG_HIDDEN);
     if (sensor_container)   lv_obj_add_flag(sensor_container, LV_OBJ_FLAG_HIDDEN);
     if (trend_container)    lv_obj_add_flag(trend_container, LV_OBJ_FLAG_HIDDEN);
@@ -2534,8 +2587,19 @@ void ui_show_screen(screen_t screen) {
         break;
     case SCREEN_SYSINFO:    lv_obj_clear_flag(sysinfo_container, LV_OBJ_FLAG_HIDDEN); break;
     case SCREEN_VSCODE:     lv_obj_clear_flag(vscode_container, LV_OBJ_FLAG_HIDDEN); break;
-    case SCREEN_CI:         lv_obj_clear_flag(ci_container, LV_OBJ_FLAG_HIDDEN); break;
+    case SCREEN_CI:
+        if (lbl_banner && strcmp(lv_label_get_text(lbl_banner), "CI is failing") == 0)
+            banner_clear(BANNER_ALERT);
+        ci_page = 0;
+        ci_page_ms = lv_tick_get();
+        render_ci_page();
+        lv_obj_clear_flag(ci_container, LV_OBJ_FLAG_HIDDEN);
+        break;
     case SCREEN_TODAY:      lv_obj_clear_flag(today_container, LV_OBJ_FLAG_HIDDEN); break;
+    case SCREEN_CODEX:
+        refresh_codex();
+        lv_obj_clear_flag(codex_container, LV_OBJ_FLAG_HIDDEN);
+        break;
     case SCREEN_SENSOR:
         lv_obj_clear_flag(sensor_container, LV_OBJ_FLAG_HIDDEN);
         refresh_sensor_spark();
@@ -2577,7 +2641,8 @@ void ui_cycle_screen(void) {
         else if (next == SCREEN_VSCODE)    next = SCREEN_BLUETOOTH;
         else if (next == SCREEN_BLUETOOTH) next = SCREEN_CI;
         else if (next == SCREEN_CI)        next = SCREEN_TODAY;
-        else if (next == SCREEN_TODAY)     next = SCREEN_SPLASH;
+        else if (next == SCREEN_TODAY)     next = SCREEN_CODEX;
+        else if (next == SCREEN_CODEX)     next = SCREEN_SPLASH;
         else                              next = SCREEN_CLOCK;  // from SPLASH (or first run)
         // Skip screens that have never received data from the daemon, or
         // that the user has hidden, so cycling only surfaces real content

@@ -42,7 +42,7 @@ FIXTURES = Path(__file__).resolve().parent / "fixtures" / "payloads.json"
 DEFAULT_REPORT = ROOT / "firmware" / ".pio" / "build" / "ideaspark_114_st7789" / "perf_report.md"
 
 SCREEN_NAMES = ["Splash", "Clock", "Sensor", "Sensor Trend", "Usage", "Copilot",
-                "SysInfo", "VS Code", "Connectivity", "Checks", "Today", "Aurora"]
+                "SysInfo", "VS Code", "Connectivity", "Checks", "Today", "Aurora", "Codex"]
 
 WIFI_STATES = {0: "off (no credentials)", 1: "connecting", 2: "connected", 3: "failed"}
 

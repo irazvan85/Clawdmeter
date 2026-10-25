@@ -15,12 +15,14 @@ enum screen_t {
     SCREEN_CI,
     SCREEN_TODAY,
     SCREEN_AURORA,
+    SCREEN_CODEX,
     SCREEN_COUNT,
 };
 
 void ui_init(void);
 void ui_update(const UsageData* data);
 void ui_update_copilot(const CopilotData* data);
+void ui_update_codex(const CodexData* data);
 void ui_update_sysinfo(const SysInfoData* data);
 void ui_update_vscode(const VscodeData* data);
 void ui_update_env(const EnvData* data);         // {"src":"env",...} — clock + weather
