@@ -21,7 +21,7 @@ static const theme_t THEME_PRESETS[THEME_PRESET_COUNT] = {
 static const screen_t CFG_SCREEN_ORDER[] = {
     SCREEN_CLOCK, SCREEN_AURORA, SCREEN_SENSOR, SCREEN_SENSOR_GRAPH, SCREEN_USAGE,
     SCREEN_COPILOT, SCREEN_SYSINFO, SCREEN_VSCODE, SCREEN_BLUETOOTH,
-    SCREEN_CI, SCREEN_TODAY, SCREEN_CODEX,
+    SCREEN_CI, SCREEN_TODAY, SCREEN_CODEX, SCREEN_AIR, SCREEN_GASES,
 };
 #define CFG_SCREEN_COUNT (sizeof(CFG_SCREEN_ORDER) / sizeof(CFG_SCREEN_ORDER[0]))
 
@@ -45,10 +45,15 @@ void device_config_init(void) {
     if (p.begin(CFG_NVS_NS, false)) {
         theme_idx    = (uint8_t)p.getUChar("theme", 0);
         visible_mask = p.getUShort("vismask", DEFAULT_MASK);
-        if (p.getUChar("screenver", 0) < 1) {
-            visible_mask |= (1u << (CFG_SCREEN_COUNT - 1));
+        // A mask saved before a screen was appended has that screen's bit
+        // clear -- turn each newly appended screen on once, by version.
+        uint8_t ver = p.getUChar("screenver", 0);
+        if (ver < 3) {
+            if (ver < 1) visible_mask |= (1u << 11);   // v1: SCREEN_CODEX
+            if (ver < 2) visible_mask |= (1u << 12);   // v2: SCREEN_AIR
+            visible_mask |= (1u << 13);                // v3: SCREEN_GASES
             p.putUShort("vismask", visible_mask);
-            p.putUChar("screenver", 1);
+            p.putUChar("screenver", 3);
         }
         p.end();
     }

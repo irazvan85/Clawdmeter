@@ -110,3 +110,30 @@ struct AuroraData {
     bool night;          // false = daylight (aurora won't be visible regardless of pct)
     bool valid;          // false until first successful parse
 };
+
+// MQ-135 air-quality reading — on-device (gas_sensor.cpp, ADC on GPIO 34),
+// not a daemon payload. Filled by gas_sensor_get(), pushed to the UI by main.cpp.
+enum AirLevel { AIR_GOOD, AIR_FAIR, AIR_POOR, AIR_BAD };
+
+// Heuristic guess at what's behind a drop, from how fast it happened. Not a
+// measurement -- the MQ-135 can't tell gases apart.
+enum AirHint { AIR_HINT_NONE, AIR_HINT_SPIKE, AIR_HINT_SLOW };
+
+// Order of AirData::gas_ppm[] / gas_level[], and of GAS_DEFS[] in gas_sensor.cpp.
+enum AirGas { GAS_CO2, GAS_NH3, GAS_ALCOHOL, GAS_TOLUENE, GAS_ACETONE, GAS_CO, AIR_GAS_COUNT };
+
+struct AirData {
+    bool     present;      // false = nothing on the pin (reads ~0 V)
+    bool     warming;      // heater still settling after boot; numbers not trusted yet
+    int      warm_left_s;  // seconds of warm-up remaining (0 once warm)
+    bool     calibrated;   // baseline set by `gascal`, not auto-tracked
+    int      mv;           // sensor output, mV at the module's S pin (divider undone)
+    float    ratio;        // Rs / R0 — 1.0 = baseline clean air, lower = dirtier
+    AirLevel level;        // from ratio alone — gas-agnostic headline
+    bool     saturated;    // output pinned at the ADC/supply ceiling — off-scale
+    AirHint  hint;
+    // Per-gas *equivalents*: what each gas would read if it alone caused the
+    // drop. One sensor, one reading -- these move together, not independently.
+    float    gas_ppm[AIR_GAS_COUNT];
+    AirLevel gas_level[AIR_GAS_COUNT];
+};

@@ -8,6 +8,7 @@
 #include "wifi_net.h"
 #include "device_config.h"
 #include "ui.h"
+#include "gas_sensor.h"
 
 static WebServer server(80);
 
@@ -132,6 +133,40 @@ static void handle_screen_post() {
     server.send(200, "application/json", out);
 }
 
+// POST /api/gas  action=cal|auto  -- MQ-135 baseline, the dashboard's
+// equivalent of the Air screen long-press (cal) and serial `gasauto` (auto).
+// Token-gated: a stray calibration in dirty air skews every reading after it.
+static void handle_gas_post() {
+    if (server.header("X-Auth-Token") != wifi_get_token()) {
+        server.send(401, "text/plain", "bad token");
+        return;
+    }
+    String action = server.arg("action");
+    const char* result;
+    int code = 200;
+    if (action == "cal") {
+        GasCalResult r = gas_sensor_calibrate(false);
+        result = r == GAS_CAL_OK ? "ok" : r == GAS_CAL_WARMING ? "warming" : "no_sensor";
+        if (r != GAS_CAL_OK) code = 409;
+        else                 ui_show_notice("Baseline set", true);
+    } else if (action == "auto") {
+        gas_sensor_auto();
+        result = "ok";
+    } else {
+        server.send(400, "text/plain", "bad request");
+        return;
+    }
+    AirData a = {};
+    gas_sensor_get(&a);
+    JsonDocument doc;
+    doc["ok"] = code == 200;
+    doc["result"] = result;
+    doc["calibrated"] = a.calibrated;
+    String out;
+    serializeJson(doc, out);
+    server.send(code, "application/json", out);
+}
+
 static void write_le16(uint8_t* p, uint16_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); }
 static void write_le32(uint8_t* p, uint32_t v) {
     p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24);
@@ -229,6 +264,7 @@ void web_server_init(void) {
     server.on("/api/config", HTTP_GET, handle_config_get);
     server.on("/api/config", HTTP_POST, handle_config_post);
     server.on("/api/screen", HTTP_POST, handle_screen_post);
+    server.on("/api/gas", HTTP_POST, handle_gas_post);
 }
 
 void web_server_tick(void) {

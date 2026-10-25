@@ -11,6 +11,7 @@
 #include "sensor_hist.h"
 #include "usage_hist.h"
 #include "device_config.h"
+#include "gas_sensor.h"
 
 // Custom fonts (scaled for 135x240 1.14" IPS)
 LV_FONT_DECLARE(font_tiempos_34);
@@ -763,6 +764,12 @@ static void timer_start_phase(tmr_state_t phase) {
     ui_flash_feedback_strong();
 }
 
+// Transient confirmation for a long-press action. Shares the timer's banner
+// slot: both are short-lived and lower priority than alerts / "needs you".
+void ui_show_notice(const char* text, bool ok) {
+    banner_show(BANNER_TIMER, text, ok ? COL_GREEN : COL_AMBER, COL_BG, 3000);
+}
+
 void ui_timer_toggle(void) {
     if (g_tmr == TMR_OFF) {
         tmr_round = 1;
@@ -1370,6 +1377,7 @@ static void init_sensor_screen(lv_obj_t* scr) {
 #define COL_TR_TEMP   lv_color_hex(0xd97757)   // brand terra-cotta
 #define COL_TR_HUM    lv_color_hex(0x6a9ec0)   // muted blue
 #define COL_TR_PRESS  lv_color_hex(0xa89bc4)   // muted violet
+#define COL_TR_AQ     lv_color_hex(0x7fb5a5)   // muted teal
 
 // Smallest y-axis span we'll scale to, per metric. Without a floor, a room
 // that held dead steady all day renders sensor noise as a mountain range.
@@ -1377,6 +1385,7 @@ static const float TREND_MIN_SPAN[SH_METRIC_COUNT] = {
     2.0f,   // degC
     5.0f,   // %RH
     4.0f,   // hPa
+    0.10f,  // Rs/R0 (air quality)
 };
 
 #define TREND_PAD     5     // card inset
@@ -1405,6 +1414,7 @@ static void fmt_metric(sh_metric_t m, float v, char* b, size_t n, bool with_unit
     switch (m) {
     case SH_TEMP:  snprintf(b, n, with_unit ? "%.1f C"   : "%.1f", (double)v); break;
     case SH_HUM:   snprintf(b, n, with_unit ? "%.0f%%"   : "%.0f", (double)v); break;
+    case SH_AQ:    snprintf(b, n, "%.2f", (double)v); break;
     default:       snprintf(b, n, with_unit ? "%.0f hPa" : "%.0f", (double)v); break;
     }
 }
@@ -1602,8 +1612,10 @@ static void refresh_trend_screen(void) {
     // axis than they belong. Say so rather than implying exact timing.
     lv_label_set_text(lbl_trend_from, sensor_hist_time_is_real() ? "-24h" : "~24h");
 
-    const float live[SH_METRIC_COUNT] = { g_env_t, g_env_h, g_env_p };
-    for (int m = 0; m < SH_METRIC_COUNT; m++) {
+    // Env metrics only -- SH_AQ has its own page (the Air screen), and
+    // trend[SH_AQ] is never built.
+    const float live[SH_METRIC_COUNT] = { g_env_t, g_env_h, g_env_p, NAN };
+    for (int m = SH_TEMP; m <= SH_PRESS; m++) {
         if (m == SH_HUM && !sensor_shows_humidity) continue;
         trend_rebuild(&trend[m]);
         char b[16];
@@ -1649,11 +1661,135 @@ static void refresh_sensor_spark(void) {
     lv_label_set_text(spark.lbl_val, b);
 }
 
+// ======== Air Screen (MQ-135, on-device ADC -- gas_sensor.cpp) ========
+//
+// Level word up top (what you actually want to know at a glance), Rs/R0 under
+// it with a bar (1.0 = clean, 0.4 = full), a status line (warm-up / source
+// hint / raw voltage, plus baseline mode), and the 24 h ratio trace. The ratio
+// leads because it's the one thing the sensor measures; per-gas equivalents
+// live on the Gases page.
+
+#define AIR_BAR_FULL  0.4f   // ratio at which the bar is full
+#define AIR_SPARK_Y   140
+
+static lv_obj_t* air_container;
+static lv_obj_t* lbl_air_level;
+static lv_obj_t* lbl_air_ratio;
+static lv_obj_t* bar_air;
+static lv_obj_t* lbl_air_status;
+static lv_obj_t* lbl_air_base;
+static trend_plot_t air_spark;
+// Sticky: set by the first reading with something on the pin, never cleared.
+// A sensor that drops out later keeps its screen (showing "No sensor") rather
+// than vanishing from the cycle mid-session.
+static bool air_has_data = false;
+
+static void init_air_screen(lv_obj_t* scr) {
+    air_container = make_screen_container(scr, "Air");
+
+    lbl_air_level = lv_label_create(air_container);
+    lv_label_set_text(lbl_air_level, "--");
+    lv_obj_set_style_text_font(lbl_air_level, &font_styrene_24, 0);
+    lv_obj_set_style_text_color(lbl_air_level, COL_TEXT, 0);
+    lv_obj_set_pos(lbl_air_level, MARGIN + 2, CONTENT_Y - 4);
+
+    lbl_air_ratio = lv_label_create(air_container);
+    lv_label_set_text(lbl_air_ratio, "--");
+    lv_obj_set_style_text_font(lbl_air_ratio, &font_styrene_16, 0);
+    lv_obj_set_style_text_color(lbl_air_ratio, COL_TEXT, 0);
+    lv_obj_set_pos(lbl_air_ratio, MARGIN + 2, CONTENT_Y + 30);
+
+    lv_obj_t* unit = lv_label_create(air_container);
+    lv_label_set_text(unit, "Rs/R0");
+    lv_obj_set_style_text_font(unit, &font_styrene_12, 0);
+    lv_obj_set_style_text_color(unit, COL_DIM, 0);
+    lv_obj_align(unit, LV_ALIGN_TOP_RIGHT, -MARGIN - 2, CONTENT_Y + 33);
+
+    bar_air = make_bar(air_container, MARGIN, CONTENT_Y + 54, CONTENT_W, 8);
+
+    lbl_air_status = lv_label_create(air_container);
+    lv_label_set_text(lbl_air_status, "");
+    lv_obj_set_style_text_font(lbl_air_status, &font_styrene_12, 0);
+    lv_obj_set_style_text_color(lbl_air_status, COL_DIM, 0);
+    lv_obj_set_pos(lbl_air_status, MARGIN + 2, CONTENT_Y + 68);
+
+    lbl_air_base = lv_label_create(air_container);
+    lv_label_set_text(lbl_air_base, "");
+    lv_obj_set_style_text_font(lbl_air_base, &font_styrene_12, 0);
+    lv_obj_set_style_text_color(lbl_air_base, COL_DIM, 0);
+    lv_obj_align(lbl_air_base, LV_ALIGN_TOP_RIGHT, -MARGIN - 2, CONTENT_Y + 68);
+
+    make_trend_panel(air_container, AIR_SPARK_Y, SPARK_BOTTOM - AIR_SPARK_Y,
+                     "Trend", SH_AQ, COL_TR_AQ, &air_spark);
+
+    lv_obj_add_flag(air_container, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void refresh_air_spark(void) {
+    trend_rebuild(&air_spark);
+    lv_label_set_text(air_spark.lbl_val, sensor_hist_time_is_real() ? "24h" : "~24h");
+}
+
+static lv_color_t air_level_color(AirLevel l) {
+    switch (l) {
+    case AIR_GOOD: return COL_GREEN;
+    case AIR_FAIR: return COL_AMBER;
+    default:       return COL_RED;
+    }
+}
+
+// ======== Gases Screen (per-gas equivalents of the one MQ-135 reading) ========
+//
+// Built together with the Air screen. Each row is the datasheet curve for that
+// gas applied to the same Rs/R0, so the rows always move together -- the
+// footer says so, so nobody reads them as six separate measurements.
+
+static lv_obj_t* gases_container;
+static lv_obj_t* lbl_gas_v[AIR_GAS_COUNT];
+
+static void init_gases_screen(lv_obj_t* scr) {
+    gases_container = make_screen_container(scr, "Gases");
+    for (int i = 0; i < AIR_GAS_COUNT; i++)
+        lbl_gas_v[i] = make_today_row(gases_container, CONTENT_Y + 2 + i * 26, GAS_DEFS[i].name);
+
+    lv_obj_t* foot = lv_label_create(gases_container);
+    lv_label_set_text(foot, "ppm equiv. - 1 sensor");
+    lv_obj_set_style_text_font(foot, &font_styrene_12, 0);
+    lv_obj_set_style_text_color(foot, COL_DIM, 0);
+    lv_obj_set_pos(foot, MARGIN + 2, 214);
+
+    lv_obj_add_flag(gases_container, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void refresh_gases(const AirData* a) {
+    for (int i = 0; i < AIR_GAS_COUNT; i++) {
+        const GasDef& g = GAS_DEFS[i];
+        float excess = a->gas_ppm[i] - g.base;
+        char b[16];
+        lv_color_t col = COL_TEXT;
+        if (!a->present || a->warming) {
+            snprintf(b, sizeof(b), "--");
+            col = COL_DIM;
+        } else {
+            // Outside the datasheet's plotted range the curve is extrapolation:
+            // say "<" / ">" rather than print a confident number.
+            if (excess > g.hi)                  snprintf(b, sizeof(b), ">%.0f", (double)(g.base + g.hi));
+            else if (g.base > 0 || excess >= g.lo) snprintf(b, sizeof(b), "%.0f", (double)a->gas_ppm[i]);
+            else                                snprintf(b, sizeof(b), "<%.0f", (double)g.lo);
+            if (a->gas_level[i] == AIR_FAIR)      col = COL_AMBER;
+            else if (a->gas_level[i] != AIR_GOOD) col = COL_RED;
+        }
+        lv_label_set_text(lbl_gas_v[i], b);
+        lv_obj_set_style_text_color(lbl_gas_v[i], col, 0);
+    }
+}
+
 // Redraw whichever trend view is on screen. Cheap enough to call on every
 // reading change, but rate-limited by ui_tick_anim() anyway.
 static void refresh_trends_if_visible(void) {
     if (current_screen == SCREEN_SENSOR)            refresh_sensor_spark();
     else if (current_screen == SCREEN_SENSOR_GRAPH) refresh_trend_screen();
+    else if (current_screen == SCREEN_AIR)          refresh_air_spark();
 }
 
 // ======== Public API ========
@@ -1663,7 +1799,7 @@ static void refresh_trends_if_visible(void) {
 // short row of dots gives a sense of "how many presses to get back here"
 // without a persistent on-screen element. Shown for DOTS_VISIBLE_MS after
 // every ui_show_screen(), then hidden by ui_tick_anim().
-#define MAX_DOTS 11
+#define MAX_DOTS 14   // >= CYCLE_COUNT, or the last stops never light up (14 x 8 px fits)
 static lv_obj_t* dot_objs[MAX_DOTS] = { nullptr };
 static uint32_t  dots_hide_ms = 0;   // 0 = not pending
 #define DOTS_VISIBLE_MS  1500
@@ -1673,9 +1809,10 @@ static uint32_t  dots_hide_ms = 0;   // 0 = not pending
 static const screen_t CYCLE_ORDER[] = {
     SCREEN_CLOCK, SCREEN_AURORA, SCREEN_SENSOR, SCREEN_SENSOR_GRAPH, SCREEN_USAGE,
     SCREEN_COPILOT, SCREEN_SYSINFO, SCREEN_VSCODE, SCREEN_BLUETOOTH,
-    SCREEN_CI, SCREEN_TODAY, SCREEN_CODEX,
+    SCREEN_CI, SCREEN_TODAY, SCREEN_CODEX, SCREEN_AIR, SCREEN_GASES,
 };
 #define CYCLE_COUNT (sizeof(CYCLE_ORDER) / sizeof(CYCLE_ORDER[0]))
+static_assert(MAX_DOTS >= CYCLE_COUNT, "raise MAX_DOTS with CYCLE_ORDER");
 
 static bool screen_is_populated(screen_t s) {
     switch (s) {
@@ -1685,6 +1822,8 @@ static bool screen_is_populated(screen_t s) {
     case SCREEN_CODEX:        return codex_has_data;
     case SCREEN_TODAY:        return today_has_data;
     case SCREEN_AURORA:       return aurora_has_data;
+    case SCREEN_AIR:
+    case SCREEN_GASES:        return air_has_data;
     case SCREEN_SENSOR:
     case SCREEN_SENSOR_GRAPH: return sensor_has_data;
     default:                  return true;
@@ -2257,6 +2396,60 @@ int ui_get_act_agents(void) { return g_act_agents; }
 
 const char* ui_get_daemon_state(void) { return daemon_state; }
 
+// MQ-135 reading, pushed locally by main.cpp (on-device, like the env sensor
+// below -- no note_data()). Air + Gases are built lazily on the first reading
+// with something actually on the pin (CLAUDE.md gotcha #14).
+void ui_update_air(const AirData* a) {
+    if (!air_has_data) {
+        if (!a->present) return;   // nothing wired: never build the screens
+        init_air_screen(lv_screen_active());
+        init_gases_screen(lv_screen_active());
+        air_has_data = true;
+    }
+    refresh_gases(a);
+
+    char b[32];
+    if (!a->present) {
+        lv_label_set_text(lbl_air_level, "No sensor");
+        lv_obj_set_style_text_color(lbl_air_level, COL_DIM, 0);
+        lv_label_set_text(lbl_air_ratio, "--");
+        lv_bar_set_value(bar_air, 0, LV_ANIM_OFF);
+        lv_label_set_text(lbl_air_status, "check wiring");
+        lv_label_set_text(lbl_air_base, "");
+        return;
+    }
+
+    static const char* const NAMES[] = { "Good", "Fair", "Poor", "Bad" };
+    lv_color_t col = air_level_color(a->level);
+    if (a->warming) {
+        lv_label_set_text(lbl_air_level, "Warming");
+        lv_obj_set_style_text_color(lbl_air_level, COL_DIM, 0);
+        snprintf(b, sizeof(b), "heater %d:%02d", a->warm_left_s / 60, a->warm_left_s % 60);
+    } else {
+        lv_label_set_text(lbl_air_level, NAMES[a->level]);   // saturated => AIR_BAD
+        lv_obj_set_style_text_color(lbl_air_level, col, 0);
+        if (a->hint == AIR_HINT_SPIKE)     snprintf(b, sizeof(b), "spike: VOC/alc?");
+        else if (a->hint == AIR_HINT_SLOW) snprintf(b, sizeof(b), "stale: air out?");
+        else snprintf(b, sizeof(b), "%d.%02dV", a->mv / 1000, (a->mv % 1000) / 10);
+    }
+    lv_label_set_text(lbl_air_status, b);
+    lv_obj_set_style_text_color(lbl_air_status,
+                                a->hint != AIR_HINT_NONE ? COL_AMBER : COL_DIM, 0);
+
+    // A cold heater reads as heavily polluted air -- no number until it settles.
+    if (a->warming) snprintf(b, sizeof(b), "--");
+    else            snprintf(b, sizeof(b), "%.2f", (double)a->ratio);
+    lv_label_set_text(lbl_air_ratio, b);
+
+    float fill = (1.0f - a->ratio) / (1.0f - AIR_BAR_FULL);
+    if (fill < 0) fill = 0;
+    if (fill > 1) fill = 1;
+    lv_bar_set_value(bar_air, (int)lroundf(fill * 100), LV_ANIM_OFF);
+    lv_obj_set_style_bg_color(bar_air, a->warming ? COL_DIM : col, LV_PART_INDICATOR);
+
+    lv_label_set_text(lbl_air_base, a->calibrated ? "cal" : "auto");
+}
+
 // Env sensor reading (BME280 or BMP180, whichever env_sensor.cpp found),
 // pushed locally by main.cpp — not a daemon payload, so no note_data() here;
 // this shouldn't count toward daemon-link freshness.
@@ -2462,7 +2655,8 @@ void ui_tick_anim(void) {
     // Trend graphs advance on a 15-minute cadence, so a slow refresh is
     // plenty — it keeps the right-hand edge tracking the live reading
     // without rebuilding polylines on every sensor poll.
-    if (current_screen == SCREEN_SENSOR || current_screen == SCREEN_SENSOR_GRAPH) {
+    if (current_screen == SCREEN_SENSOR || current_screen == SCREEN_SENSOR_GRAPH ||
+        current_screen == SCREEN_AIR) {
         static uint32_t trend_last_ms = 0;
         if (now - trend_last_ms >= 15000) {
             trend_last_ms = now;
@@ -2566,6 +2760,8 @@ void ui_show_screen(screen_t screen) {
     if (today_container)    lv_obj_add_flag(today_container, LV_OBJ_FLAG_HIDDEN);
     if (sensor_container)   lv_obj_add_flag(sensor_container, LV_OBJ_FLAG_HIDDEN);
     if (trend_container)    lv_obj_add_flag(trend_container, LV_OBJ_FLAG_HIDDEN);
+    if (air_container)      lv_obj_add_flag(air_container, LV_OBJ_FLAG_HIDDEN);
+    if (gases_container)    lv_obj_add_flag(gases_container, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(conn_container, LV_OBJ_FLAG_HIDDEN);
     splash_hide();
 
@@ -2608,6 +2804,11 @@ void ui_show_screen(screen_t screen) {
         lv_obj_clear_flag(trend_container, LV_OBJ_FLAG_HIDDEN);
         refresh_trend_screen();
         break;
+    case SCREEN_AIR:
+        lv_obj_clear_flag(air_container, LV_OBJ_FLAG_HIDDEN);
+        refresh_air_spark();
+        break;
+    case SCREEN_GASES:      lv_obj_clear_flag(gases_container, LV_OBJ_FLAG_HIDDEN); break;
     case SCREEN_BLUETOOTH:  lv_obj_clear_flag(conn_container, LV_OBJ_FLAG_HIDDEN); break;
     default: break;
     }

@@ -12,8 +12,9 @@ This file is for future Claude Code sessions to bootstrap quickly. Read this fir
 - PMU: **none** (no battery, no AXP)
 - IMU: **none** (no auto-rotation; rotation fixed at 0)
 - USB-serial: CH340 on **COM13** (Windows)
+- MQ-135 gas sensor (optional): module V -> 5V, G -> GND, S -> 10k -> **GPIO 34**, plus 10k GPIO 34 -> GND (divider halves the 0-5 V output; `GAS_DIVIDER` in `gas_sensor.h`). Must be an ADC1 pin (32-39) — ADC2 is dead while WiFi is up. Keep it away from the BME280: the heater warms its surroundings.
 - Buttons: GPIO 0 (back/left button only). GPIO 18 is LCD SCLK — **cannot be used as button**.
-  Short press = cycle screen. Long press (≥700 ms) = context action: on Connectivity, forget the stored WiFi network; on Clock, toggle the focus timer; elsewhere, no effect beyond the flash feedback (used to request an immediate daemon poll over BLE — dropped when BLE was removed, see gotcha #14).
+  Short press = cycle screen. Long press (≥700 ms) = context action: on Connectivity, forget the stored WiFi network; on Clock, toggle the focus timer; on Air, set the MQ-135 clean-air baseline (same as serial `gascal` / dashboard "Calibrate baseline" → token-gated `POST /api/gas action=cal|auto`; refused while the heater is warming); elsewhere, no effect beyond the flash feedback (used to request an immediate daemon poll over BLE — dropped when BLE was removed, see gotcha #14).
 
 ## Architecture
 
@@ -23,7 +24,21 @@ display_cfg.h   — pin defines (ST7789 SPI), LCD_WIDTH=135, LCD_HEIGHT=240, ext
 ui.{h,cpp}      — 13-screen UI (see Screens below); redesigned for 135×240
 splash.{h,cpp}  — 20×20 pixel-art animation engine; 6× upscale (120×120) on splash, 4× (80×80) on Copilot screen
 env_sensor.{h,cpp} — BME280/BMP180 dispatcher; owns Wire.begin(21, 22)
+gas_sensor.{h,cpp} — MQ-135 on GPIO 34 (ADC1): oversampled + smoothed reading,
+                   Rs/R0 against a clean-air baseline (auto-tracks the cleanest
+                   reading until serial `gascal` pins it; NVS namespace "gas"),
+                   temp/humidity-compensated from env_sensor when present,
+                   180 s heater warm-up. Headline level comes from Rs/R0 alone;
+                   GAS_DEFS[] applies the datasheet curves (MQSensorsLib fits,
+                   clean air = 3.6 in datasheet terms) to that one ratio for
+                   CO2/NH3/alcohol/toluene/acetone/CO *equivalents* -- one
+                   sensor can't separate gases, so they move together. Also a
+                   spike-vs-gradual "likely source" hint (heuristic). Pinned by
+                   tools/tests/test_gas_table.py.
 sensor_hist.{h,cpp} — 24 h ring buffer of sensor readings (96 × 15 min), persisted to NVS
+                   (temp/hum/press from env_sensor, plus SH_AQ = Rs/R0 x1000 from
+                   gas_sensor via its own sensor_hist_sample_aq() -- the ratio, so
+                   every gas equivalent is derivable from history)
 usage_hist.{h,cpp}  — 24 h ring buffer of Claude session/weekly usage % (same
                        design as sensor_hist, kept as a sibling module — see
                        usage_hist.h for why), feeds the Usage screen sparklines
@@ -123,7 +138,7 @@ splash_animations.h — generated, do not hand-edit
 
 ## Screens
 
-`screen_t` in `ui.h` (SCREEN_COUNT = 13; the `SCREEN_BLUETOOTH` enum name is unchanged — purely cosmetic to rename now that its content is WiFi-only, on-screen title is already "Connectivity"). Short-press cycles in this order, skipping any screen that has never received data from the daemon: Clock → Aurora → Sensor → Sensor Trend → Usage → Copilot → SysInfo → VS Code → Connectivity → CI (labeled "Checks" in UI) → Today → Codex → Splash → Clock…
+`screen_t` in `ui.h` (SCREEN_COUNT = 15; the `SCREEN_BLUETOOTH` enum name is unchanged — purely cosmetic to rename now that its content is WiFi-only, on-screen title is already "Connectivity"). Short-press cycles in this order, skipping any screen that has never received data from the daemon: Clock → Aurora → Sensor → Sensor Trend → Usage → Copilot → SysInfo → VS Code → Connectivity → CI (labeled "Checks" in UI) → Today → Codex → Air → Gases → Splash → Clock…
 
 | Screen | Payload `src` | Shows |
 | --- | --- | --- |
@@ -140,6 +155,8 @@ splash_animations.h — generated, do not hand-edit
 | `SCREEN_BLUETOOTH` | — | Titled "Connectivity" on-screen. WiFi state, IP + HTTP auth token + mDNS hostname once connected (else the connection state), hold-to-forget-network hint |
 | `SCREEN_CI` | `ci` | Up to four priority-ordered items rotating every 8 s: repo, PR/title, actual run branch/SHA, workflow, failing job/step, review queue and local git summary. Dashboard provides check/PR links. |
 | `SCREEN_TODAY` | `sum` | Daily digest: active minutes, tokens, cost, commits, Copilot requests used |
+| `SCREEN_AIR` | on-device ADC | MQ-135 air quality: level word (Good/Fair/Poor/Bad, from Rs/R0), Rs/R0 + bar, status line (warm-up / likely-source hint / output voltage), auto/cal baseline, 24 h Rs/R0 trend. Built lazily on the first reading with something on GPIO 34. ID 13, visibility bit 12. |
+| `SCREEN_GASES` | on-device ADC | Per-gas ppm *equivalents* of the same MQ-135 reading (CO2, NH3, Alcohol, Toluene, Acetone, CO), coloured against each gas's thresholds; "<10"/">max" outside the datasheet range. Built with Air. ID 14, visibility bit 13. |
 
 `act` payloads (`ui_update_act`) don't own a screen — they drive the activity dot/word on Usage and, on `ACT_NEEDS_INPUT`, a persistent "Claude needs you" banner that overlays whatever screen is active until dismissed by a press. The focus timer (Clock long-press) uses the same banner widget for a transient "Focus"/"Break time" message.
 
@@ -162,7 +179,7 @@ The `run` project skill (`.claude/skills/run/SKILL.md`) has the full build/flash
 
 The firmware ships a `screenshot` serial command that dumps the LVGL framebuffer over the serial port. `./screenshot.sh out.png COM13` (or the Windows equivalent) captures a 135×240 PNG. **Use this on every UI iteration** — read the PNG, verify visually, iterate.
 
-The boot screen is `SCREEN_SPLASH` and only advances on a physical button press. To screenshot a different screen without asking the user to press a button, **temporarily change the default boot screen** in `main.cpp` (search for `ui_show_screen(SCREEN_SPLASH);`) to any value from the `screen_t` enum (see Screens above), iterate, then revert before committing. Alternatively, use the serial QA commands without touching code: `screen <N>` jumps to a screen index directly, and `feed <json>` injects a payload (e.g. `feed {"src":"ci","state":"fail",...}`) as if it arrived over BLE — see `check_serial_cmd()` in `main.cpp` for the full command list (`token`, `cfg`, `cycle`, `timer`, `histfill`, `histclear`, `uhistfill`, `uhistclear`, `i2cscan`, `gpiotest`, `perf`, `perf reset`).
+The boot screen is `SCREEN_SPLASH` and only advances on a physical button press. To screenshot a different screen without asking the user to press a button, **temporarily change the default boot screen** in `main.cpp` (search for `ui_show_screen(SCREEN_SPLASH);`) to any value from the `screen_t` enum (see Screens above), iterate, then revert before committing. Alternatively, use the serial QA commands without touching code: `screen <N>` jumps to a screen index directly, and `feed <json>` injects a payload (e.g. `feed {"src":"ci","state":"fail",...}`) as if it arrived over BLE — see `check_serial_cmd()` in `main.cpp` for the full command list (`token`, `cfg`, `cycle`, `timer`, `gas`, `gascal`, `gasauto`, `histfill`, `histclear`, `uhistfill`, `uhistclear`, `i2cscan`, `gpiotest`, `perf`, `perf reset`).
 
 ## Critical gotchas
 

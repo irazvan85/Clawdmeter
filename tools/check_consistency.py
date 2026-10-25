@@ -6,7 +6,7 @@ codebase -- the kind of invariant that compiles fine when broken and only
 shows up as a wrong screen, a mis-labeled checkbox, or a stale web page on
 the device.
 
-  screen-enum       ui.h's screen_t enum vs SCREEN_COUNT (13)
+  screen-enum       ui.h's screen_t enum vs SCREEN_COUNT (15)
   cycle-order       ui.cpp CYCLE_ORDER[] == device_config.cpp CFG_SCREEN_ORDER[]
                     (bit i of the visibility mask means CYCLE_ORDER[i])
   required-bits     device_config.cpp CLOCK_BIT/CONN_BIT point at Clock/Connectivity
@@ -40,6 +40,8 @@ LABELS = {
     "SCREEN_BLUETOOTH": "Connectivity", "SCREEN_CI": "Checks", "SCREEN_TODAY": "Today",
     "SCREEN_AURORA": "Aurora",
     "SCREEN_CODEX": "Codex",
+    "SCREEN_AIR": "Air",
+    "SCREEN_GASES": "Gases",
 }
 
 

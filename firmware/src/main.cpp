@@ -7,6 +7,7 @@
 #include "power.h"
 #include "imu.h"
 #include "env_sensor.h"
+#include "gas_sensor.h"
 #include "sensor_hist.h"
 #include "usage_hist.h"
 #include "splash.h"
@@ -281,6 +282,28 @@ static bool process_payload(const char* raw) {
 // GET /api/state (web_server.cpp) — dump everything the device currently
 // holds, from the same structs process_payload() above populates.
 void build_state_json(JsonDocument& doc) {
+    {
+        AirData a = {};
+        bool ok = gas_sensor_get(&a);
+        static const char* const LEVELS[] = { "good", "fair", "poor", "bad" };
+        static const char* const HINTS[]  = { "", "spike", "slow" };
+        JsonObject air = doc["air"].to<JsonObject>();
+        air["present"]    = ok && a.present;
+        air["warming"]    = a.warming;
+        air["calibrated"] = a.calibrated;
+        air["mv"]         = a.mv;
+        air["ratio"]      = roundf(a.ratio * 1000) / 1000;
+        air["level"]      = LEVELS[a.level];
+        air["saturated"]  = a.saturated;
+        air["hint"]       = HINTS[a.hint];
+        // Per-gas equivalents of the one reading -- see gas_sensor.h.
+        JsonObject gases = air["gases"].to<JsonObject>();
+        for (int i = 0; i < AIR_GAS_COUNT; i++) {
+            JsonObject g = gases[GAS_DEFS[i].key].to<JsonObject>();
+            g["ppm"]   = roundf(a.gas_ppm[i] * 10) / 10;
+            g["level"] = LEVELS[a.gas_level[i]];
+        }
+    }
     JsonObject cx = doc["codex"].to<JsonObject>();
     cx["p1"] = codex.pct[0];
     cx["p2"] = codex.pct[1];
@@ -514,6 +537,16 @@ static void check_serial_cmd() {
                 env_sensor_scan_bus();
             } else if (strcmp(cmd_buf, "gpiotest") == 0) {
                 env_sensor_gpio_test();
+            } else if (strcmp(cmd_buf, "gas") == 0) {
+                gas_sensor_print();
+            } else if (strcmp(cmd_buf, "gascal") == 0) {
+                // Run in fresh air (window open / outdoors), after burn-in.
+                Serial.println(gas_sensor_calibrate(true) == GAS_CAL_OK
+                                   ? "gas baseline set" : "gas: no sensor reading");
+                gas_sensor_print();
+            } else if (strcmp(cmd_buf, "gasauto") == 0) {
+                gas_sensor_auto();
+                Serial.println("gas baseline back to auto-tracking");
             } else if (strcmp(cmd_buf, "histclear") == 0) {
                 sensor_hist_clear();
                 Serial.println("sensor history cleared");
@@ -562,6 +595,12 @@ void setup() {
     // draws the trend graphs from it.
     sensor_hist_init();
     usage_hist_init();
+
+    // MQ-135 on GPIO 34 (ADC1). Just an ADC attenuation setting plus one
+    // small NVS read for the stored baseline -- same early-boot NVS slot as
+    // the opens above. Its screen is built lazily, only once a reading shows
+    // something is actually wired to the pin.
+    gas_sensor_init();
 
     // Loads the persisted theme/visibility settings (Preferences NVS open,
     // same class of call as the two just above) and sets g_theme -- must run
@@ -634,6 +673,7 @@ void loop() {
     power_tick();
     imu_tick();
     env_sensor_tick();
+    gas_sensor_tick();
     sensor_hist_tick();
     usage_hist_tick();
     splash_tick();
@@ -650,7 +690,8 @@ void loop() {
     //                       second one landing within DOUBLE_PRESS_MS just
     //                       redirects straight to Clock.
     //   Long press        → Connectivity screen: forget the stored WiFi
-    //                       network; Clock: toggle focus timer; any other
+    //                       network; Clock: toggle focus timer; Air: set the
+    //                       MQ-135 clean-air baseline (gascal); any other
     //                       screen: no effect beyond the flash feedback
     //                       (used to ask the daemon for an immediate poll
     //                       over BLE — dropped when BLE was removed, see
@@ -681,6 +722,13 @@ void loop() {
                 wifi_set_credentials("", "");   // "forget this network"
             } else if (cs == SCREEN_CLOCK) {
                 ui_timer_toggle();   // start/stop the focus timer (flashes itself)
+            } else if (cs == SCREEN_AIR) {
+                // Calibrate the MQ-135 baseline to the air right now.
+                ui_flash_feedback_strong();
+                GasCalResult r = gas_sensor_calibrate(false);
+                ui_show_notice(r == GAS_CAL_OK      ? "Baseline set"
+                             : r == GAS_CAL_WARMING ? "Still warming"
+                                                    : "No sensor", r == GAS_CAL_OK);
             } else {
                 ui_flash_feedback_strong();
             }
@@ -743,6 +791,23 @@ void loop() {
         if (s_present && (hist_ms == 0 || millis() - hist_ms >= 10000)) {
             hist_ms = millis();
             sensor_hist_sample(s_t, s_has_h, s_h, s_p);
+        }
+    }
+
+    // MQ-135: refresh the UI every 2 s (the reading is smoothed once a
+    // second, so faster just churns labels) and log to history every 10 s,
+    // same cadence as the env sensor above. Warm-up readings aren't logged:
+    // a cold heater reads as wildly polluted air.
+    {
+        static uint32_t ui_ms = 0, hist_ms = 0;
+        AirData air;
+        if (millis() - ui_ms >= 2000 && gas_sensor_get(&air)) {
+            ui_ms = millis();
+            ui_update_air(&air);
+            if (air.present && !air.warming && millis() - hist_ms >= 10000) {
+                hist_ms = millis();
+                sensor_hist_sample_aq(air.ratio);
+            }
         }
     }
 
