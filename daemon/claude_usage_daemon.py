@@ -25,6 +25,7 @@ order.
 
 import asyncio
 import getpass
+import ipaddress
 import json
 import math
 import os
@@ -38,6 +39,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import httpx
+from codex_usage import CodexUsage, age_payload as age_codex_payload
 
 # Windows: prevent gh/git subprocess calls from flashing a console window
 # when the daemon itself runs without one (e.g. under the Scheduled Task).
@@ -61,6 +63,7 @@ COPILOT_POLL_INTERVAL = 300  # 5 minutes
 SYSINFO_POLL_INTERVAL = 30   # 30 seconds
 VSCODE_POLL_INTERVAL = 30    # 30 seconds
 ENV_POLL_INTERVAL = 900      # 15 minutes (clock + weather)
+CLOCK_SYNC_INTERVAL = 60    # also restores time promptly after a device reboot
 AURORA_POLL_INTERVAL = 300   # 5 minutes (matches NOAA OVATION nowcast refresh)
 ACT_POLL_INTERVAL = 5        # Claude activity — needs to feel responsive
 CI_POLL_INTERVAL = 120       # 2 minutes (CI status + review queue + git)
@@ -477,18 +480,23 @@ async def _resolve_location() -> tuple[float, float, str]:
 _last_cloud_pct = -1  # cloud_cover %, cached from poll_env() for poll_aurora() to reuse
 
 
+def clock_payload() -> dict:
+    """Fresh host time, independent of weather and account API availability."""
+    now = datetime.now().astimezone()
+    return {
+        "src": "env",
+        "ts": int(now.timestamp()),
+        "tz": int(now.utcoffset().total_seconds() // 60) if now.utcoffset() else 0,
+    }
+
+
 async def poll_env() -> dict:
     """Clock + local weather for the device's Clock screen (src='env').
 
     Time is always included; weather is best-effort (open-meteo, keyless).
     """
     global _last_cloud_pct
-    now = datetime.now().astimezone()
-    result: dict = {
-        "src": "env",
-        "ts": int(time.time()),
-        "tz": int(now.utcoffset().total_seconds() // 60) if now.utcoffset() else 0,
-    }
+    result = clock_payload()
 
     lat, lon, city = await _resolve_location()
     city = _ascii(city)[:15] or "Weather"
@@ -783,6 +791,85 @@ def active_session_model_ctx() -> tuple[str, int]:
     return ("", -1)
 
 
+CI_MAX_ITEMS = 4
+
+
+def _ci_state(check: dict) -> str:
+    """Normalize both CheckRun and legacy StatusContext results."""
+    conclusion = str(check.get("conclusion") or check.get("state") or "").upper()
+    if conclusion in ("FAILURE", "ERROR", "TIMED_OUT", "ACTION_REQUIRED", "STARTUP_FAILURE"):
+        return "fail"
+    if conclusion == "CANCELLED":
+        return "cancelled"
+    if str(check.get("status") or "").upper() in ("QUEUED", "IN_PROGRESS", "WAITING", "PENDING", "REQUESTED") or conclusion in ("PENDING", "EXPECTED"):
+        return "running"
+    if conclusion in ("SUCCESS", "NEUTRAL", "SKIPPED"):
+        return "pass"
+    return "none"
+
+
+def _ci_age(timestamp: str) -> int:
+    try:
+        dt = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+        if dt.year < 2000:
+            return -1
+        return max(0, int((datetime.now(timezone.utc) - dt).total_seconds() / 60))
+    except (ValueError, TypeError):
+        return -1
+
+
+def _ci_item(**values) -> dict:
+    limits = {"state": 11, "repo": 79, "title": 95, "branch": 63,
+              "sha": 8, "workflow": 79, "job": 79, "step": 79,
+              "url": 191, "pr_url": 191}
+    item = {key: _ascii(str(values.get(key) or ""))[:limit] for key, limit in limits.items()}
+    item.update(pr=int(values.get("pr") or 0), age=int(values.get("age", -1)),
+                failed=int(values.get("failed") or 0))
+    return item
+
+
+def _ci_json(args: list[str], repo: Path | None = None):
+    raw = _run(args, cwd=repo, timeout=12)
+    try:
+        return json.loads(raw) if raw is not None else None
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+
+def _ci_enrich(items: list[dict], repo: Path) -> None:
+    """Fetch at most two selected Actions runs; external checks retain their name/link."""
+    runs: dict[str, dict] = {}
+    for item in items:
+        match = re.search(r"/actions/runs/(\d+)", item["url"])
+        if not match or item["state"] != "fail":
+            continue
+        run_id = match[1]
+        if run_id not in runs:
+            if len(runs) >= 2:
+                continue
+            runs[run_id] = _ci_json(["gh", "run", "view", run_id, "--json",
+                                   "workflowName,jobs,headBranch,headSha,updatedAt"], repo) or {}
+        run = runs[run_id]
+        item["workflow"] = _ascii(run.get("workflowName") or item["workflow"])[:79]
+        # PR metadata remains authoritative for merge-ref runs.
+        if not item["pr"]:
+            item["branch"] = _ascii(run.get("headBranch") or item["branch"])[:63]
+            item["sha"] = (run.get("headSha") or item["sha"])[:8]
+        jobs = run.get("jobs") or []
+        if not item["pr"]:
+            item["failed"] = sum(_ci_state(j) == "fail" for j in jobs)
+        job_id = re.search(r"/job/(\d+)", item["url"])
+        job = next((j for j in jobs if
+                    (job_id and str(j.get("databaseId")) == job_id[1]) or
+                    j.get("name") == item["job"]), None)
+        if job is None:
+            job = next((j for j in jobs if _ci_state(j) == "fail"), None)
+        if job:
+            item["job"] = _ascii(job.get("name") or item["job"])[:79]
+            step = next((s for s in job.get("steps") or [] if _ci_state(s) == "fail"), {})
+            item["step"] = _ascii(step.get("name") or "")[:79]
+
+
 def poll_ci() -> dict | None:
     """CI run status + review queue + working tree for the active repo."""
     repo = _active_repo()
@@ -812,47 +899,82 @@ def poll_ci() -> dict | None:
         result["cf"] = conflict > 0
 
     # --- GitHub CI + PRs (needs gh + a GitHub remote) ---
-    runs = _run(["gh", "run", "list", "-L", "1", "--json",
-                 "status,conclusion,workflowName,startedAt"], cwd=repo, timeout=12)
-    if runs:
-        try:
-            arr = json.loads(runs)
-            if arr:
-                r = arr[0]
-                if r.get("status") != "completed":
-                    result["state"] = "running"
-                elif r.get("conclusion") == "success":
-                    result["state"] = "pass"
-                else:
-                    result["state"] = "fail"
-                result["wf"] = (r.get("workflowName") or "")[:18]
-                started = r.get("startedAt") or ""
-                if started:
-                    dt = datetime.fromisoformat(started.replace("Z", "+00:00"))
-                    result["age"] = max(0, int((datetime.now(timezone.utc) - dt).total_seconds() / 60))
-        except (json.JSONDecodeError, ValueError):
-            pass
+    metadata = _ci_json(["gh", "repo", "view", "--json", "nameWithOwner"], repo) or {}
+    repo_name = metadata.get("nameWithOwner") or repo.name
+    fields = "number,title,headRefName,headRefOid,reviewDecision,statusCheckRollup,url"
+    mine = _ci_json(["gh", "pr", "list", "--author", "@me", "--state", "open",
+                     "-L", "30", "--json", fields], repo)
+    current = _ci_json(["gh", "pr", "view", "--json", fields + ",state"], repo)
+    prs = list(mine or [])
+    if current and current.get("state") == "OPEN" and not any(p["number"] == current["number"] for p in prs):
+        prs.append(current)
+    candidates: list[tuple[int, dict]] = []
+    priority = {"fail": 0, "changes": 1, "running": 2, "cancelled": 3, "pass": 4, "none": 5}
+    for pr in prs:
+        checks = pr.get("statusCheckRollup") or []
+        failed = sum(_ci_state(c) == "fail" for c in checks)
+        changes = pr.get("reviewDecision") == "CHANGES_REQUESTED"
+        if mine and pr in mine and (failed or changes):
+            result["chg"] += 1
+        base = dict(repo=repo_name, pr=pr["number"], title=pr.get("title"),
+                    branch=pr.get("headRefName"), sha=pr.get("headRefOid"),
+                    pr_url=pr.get("url"), failed=failed)
+        selected = [c for c in checks if _ci_state(c) == "fail"]
+        if not selected and checks:
+            selected = [min(checks, key=lambda c: priority[_ci_state(c)])]
+        if changes:
+            selected.append({"state": "CHANGES_REQUESTED", "name": "Review changes requested", "targetUrl": pr.get("url")})
+        for check in selected or [{}]:
+            state = "changes" if check.get("state") == "CHANGES_REQUESTED" else _ci_state(check)
+            item = _ci_item(**base, state=state, workflow=check.get("workflowName"),
+                            job=check.get("name") or check.get("context"),
+                            url=check.get("detailsUrl") or check.get("targetUrl") or pr.get("url"),
+                            age=_ci_age(check.get("completedAt") or check.get("startedAt") or ""))
+            on_branch = pr.get("headRefName") == result["br"]
+            rank = {"fail": 0, "changes": 2, "running": 4, "cancelled": 6,
+                    "pass": 10, "none": 12}[state] + (0 if on_branch else 1)
+            candidates.append((rank, item))
 
-    mine = _run(["gh", "pr", "list", "--author", "@me", "--state", "open", "--json",
-                 "reviewDecision,statusCheckRollup"], cwd=repo, timeout=12)
-    if mine:
-        try:
-            for pr in json.loads(mine):
-                rollup = pr.get("statusCheckRollup") or []
-                failing = any(c.get("conclusion") in ("FAILURE", "TIMED_OUT", "CANCELLED")
-                              for c in rollup)
-                if failing or pr.get("reviewDecision") == "CHANGES_REQUESTED":
-                    result["chg"] += 1
-        except (json.JSONDecodeError, ValueError):
-            pass
+    run_args = ["gh", "run", "list", "-L", "5"]
+    if result["br"] and result["br"] != "(detached)":
+        run_args += ["--branch", result["br"]]
+    runs = _ci_json(run_args + ["--json", "status,conclusion,workflowName,updatedAt,headBranch,headSha,url"], repo)
+    seen_workflows = set()
+    for run in runs or []:
+        # Only the latest run per workflow matters; an older red run may have recovered.
+        wf = run.get("workflowName") or "Workflow"
+        if wf in seen_workflows:
+            continue
+        seen_workflows.add(wf)
+        if any(p.get("headRefName") == run.get("headBranch") for p in prs):
+            continue  # PR check rollup already describes this branch.
+        state = _ci_state(run)
+        item = _ci_item(repo=repo_name, state=state, workflow=wf,
+                        branch=run.get("headBranch"), sha=run.get("headSha"),
+                        url=run.get("url"), age=_ci_age(run.get("updatedAt") or ""))
+        candidates.append(({"fail": 0, "running": 4, "cancelled": 6, "pass": 10, "none": 12}[state], item))
 
-    tor = _run(["gh", "search", "prs", "--review-requested=@me", "--state=open",
-                "-L", "40", "--json", "url"], timeout=12)
-    if tor:
-        try:
-            result["rev"] = len(json.loads(tor))
-        except (json.JSONDecodeError, ValueError):
-            pass
+    reviews = _ci_json(["gh", "search", "prs", "--review-requested=@me", "--state=open",
+                        "-L", "40", "--json", "number,title,url,repository"])
+    result["review_ok"] = reviews is not None
+    if reviews is not None:
+        result["rev"] = len(reviews)
+        for pr in reviews:
+            candidates.append((8, _ci_item(state="review", pr=pr.get("number"),
+                title=pr.get("title"), repo=(pr.get("repository") or {}).get("nameWithOwner"),
+                url=pr.get("url"), pr_url=pr.get("url"))))
+    if runs is None and mine is None:
+        candidates.append((0, _ci_item(state="unknown", repo=repo_name,
+                                      job="GitHub checks unavailable", step="Check gh login / access")))
+    candidates.sort(key=lambda pair: pair[0])
+    result["total"] = len(candidates)
+    result["items"] = [item for _, item in candidates[:CI_MAX_ITEMS]]
+    _ci_enrich(result["items"], repo)
+    if result["items"]:
+        first = result["items"][0]
+        result.update(state=first["state"], wf=first["workflow"][:18], age=first["age"])
+    elif runs is None and mine is None:
+        result["state"] = "unknown"
 
     log(f"CI: {result['state']} {result['wf']} br={result['br']} "
         f"review={result['rev']} changes={result['chg']} dirty={result['dty']}")
@@ -1330,8 +1452,17 @@ async def resolve_device_ip() -> str | None:
         log(f"Resolve failed: {e}")
 
     if ip:
-        log(f"Found: {ip}")
-        return ip
+        # A stale literal device_host always resolves, even after DHCP moves
+        # the device. Check reachability so it cannot suppress discovery forever.
+        try:
+            async with httpx.AsyncClient(timeout=3.0, trust_env=False) as http:
+                response = await http.get(f"http://{ip}/api/state")
+            if response.status_code == 200:
+                log(f"Found: {ip}")
+                return ip
+        except httpx.HTTPError:
+            pass
+        log(f"Resolved address {ip} is unreachable; trying discovery")
 
     log("Trying UDP broadcast discovery...")
     ip = await asyncio.to_thread(_discover_broadcast_sync)
@@ -1340,6 +1471,23 @@ async def resolve_device_ip() -> str | None:
         return ip
     log("Broadcast discovery found no device")
     return None
+
+
+def _discovery_targets() -> list[str]:
+    # A global broadcast can leave through a VPN/virtual adapter on Windows.
+    # Directed broadcasts ensure the physical LAN is queried as well.
+    targets = {"255.255.255.255"}
+    try:
+        import psutil
+        for addresses in psutil.net_if_addrs().values():
+            for address in addresses:
+                if address.family == socket.AF_INET and address.netmask:
+                    interface = ipaddress.IPv4Interface(f"{address.address}/{address.netmask}")
+                    if not interface.ip.is_loopback and not interface.ip.is_link_local and interface.network.prefixlen < 31:
+                        targets.add(str(interface.network.broadcast_address))
+    except (ImportError, OSError, ValueError):
+        pass
+    return sorted(targets)
 
 
 def _discover_broadcast_sync(timeout: float = DISCOVERY_TIMEOUT) -> str | None:
@@ -1352,7 +1500,11 @@ def _discover_broadcast_sync(timeout: float = DISCOVERY_TIMEOUT) -> str | None:
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
     deadline = time.monotonic() + timeout
     try:
-        sock.sendto(DISCOVERY_REQUEST, ("255.255.255.255", DISCOVERY_PORT))
+        for target in _discovery_targets():
+            try:
+                sock.sendto(DISCOVERY_REQUEST, (target, DISCOVERY_PORT))
+            except OSError:
+                continue
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -1441,8 +1593,9 @@ class Session:
     def __init__(self, base_url: str, token: str) -> None:
         self.base_url = base_url
         self.token = token
-        self.http = httpx.AsyncClient(timeout=10.0)
+        self.http = httpx.AsyncClient(timeout=10.0, trust_env=False)
         self.write_fails = 0
+        self.write_lock = asyncio.Lock()
 
     def link_broken(self) -> bool:
         """Writes keep failing -- only a fresh IP re-resolve (mDNS or the
@@ -1463,6 +1616,14 @@ class Session:
             return False
 
     async def write_payload(self, payload: dict) -> bool:
+        async with self.write_lock:
+            return await self._write_payload(payload)
+
+    async def _write_payload(self, payload: dict) -> bool:
+        if payload.get("src") == "env":
+            # Cached weather may be replayed hours later; its clock must be
+            # sampled at send time, also after a slow weather request.
+            payload = {**payload, **clock_payload()}
         data = json.dumps(payload, separators=(",", ":"))
         log(f"Sending: {data}")
         try:
@@ -1486,6 +1647,8 @@ class Session:
     async def replay_last_payloads(self) -> None:
         """Re-send the last known values so a fresh reconnect isn't blank."""
         for src, payload in list(_last_payloads.items()):
+            if src == "codex":
+                payload = age_codex_payload(payload)
             if await self.write_payload(payload):
                 log(f"Replayed cached {src} payload")
 
@@ -1516,9 +1679,16 @@ async def run_session(ip: str, stop_event: asyncio.Event) -> bool:
             return False
 
         log("Connected")
+        await session.write_payload({**_last_payloads.get("env", {}), **clock_payload()})
         await session.replay_last_payloads()
 
-        return await _poll_loop(session, stop_event)
+        codex = CodexUsage(cfg.get("codex_path", ""), cfg.get("codex_bucket", "codex"))
+        codex_task = asyncio.create_task(codex.run(session.write_payload, stop_event))
+        try:
+            return await _poll_loop(session, stop_event)
+        finally:
+            codex_task.cancel()
+            await asyncio.gather(codex_task, return_exceptions=True)
     finally:
         await session.aclose()
 
@@ -1530,6 +1700,7 @@ async def _poll_loop(session: Session, stop_event: asyncio.Event) -> bool:
     last_sysinfo_poll = 0.0
     last_vscode_poll = 0.0
     last_env_poll = 0.0
+    last_clock_sync = 0.0
     last_aurora_poll = 0.0
     last_act_poll = 0.0
     last_act_state: str | None = None
@@ -1551,6 +1722,9 @@ async def _poll_loop(session: Session, stop_event: asyncio.Event) -> bool:
 
     while not stop_event.is_set() and not session.link_broken():
         now = time.time()
+        if now - last_clock_sync >= CLOCK_SYNC_INTERVAL:
+            await session.write_payload({**_last_payloads.get("env", {}), **clock_payload()})
+            last_clock_sync = time.time()
         elapsed = now - last_poll
         if elapsed >= POLL_INTERVAL:
             payload = await poll_active_payload()

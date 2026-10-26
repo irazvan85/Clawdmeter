@@ -46,7 +46,7 @@ class PayloadContract(unittest.TestCase):
                         if not k.startswith("_")}
 
     def test_parser_found_every_src(self):
-        for src in ("claude", "copilot", "sysinfo", "vscode", "act", "ci", "sum",
+        for src in ("claude", "codex", "copilot", "sysinfo", "vscode", "act", "ci", "sum",
                     "env", "aurora", "status", "wifi"):
             self.assertIn(src, self.contract, f"process_payload() has no '{src}' branch?")
 

@@ -5,7 +5,7 @@
 //
 // 96 slots x 15 minutes = 24 h. Each slot holds the mean of every reading
 // taken during that quarter-hour. The ring is flushed to NVS whenever it
-// rolls to a new slot (~96 writes/day of a 588-byte blob — well inside NVS
+// rolls to a new slot (~96 writes/day of a 780-byte blob — well inside NVS
 // wear budget), so the trend survives a reboot or an unplug.
 //
 // This board has no RTC: wall-clock time only arrives with the daemon's
@@ -22,6 +22,7 @@ enum sh_metric_t {
     SH_TEMP,     // deg C
     SH_HUM,      // % RH   (BME280 only)
     SH_PRESS,    // hPa
+    SH_AQ,       // MQ-135 Rs/R0 (gas_sensor.cpp) -- every gas derives from it
     SH_METRIC_COUNT,
 };
 
@@ -33,6 +34,10 @@ void sensor_hist_set_time(long epoch_utc);// daemon clock; re-anchors the ring
 // also the newest point of the trace — so the right-hand edge of the graph
 // tracks the live value.
 void sensor_hist_sample(float temp_c, bool has_hum, float hum_pct, float press_hpa);
+
+// Air-quality reading (MQ-135), fed separately: it's a different sensor on a
+// different bus, and must keep logging even when no BME280/BMP180 is wired.
+void sensor_hist_sample_aq(float ratio);
 
 // Copy one metric oldest-first into out[0..n-1] (n should be SH_SLOTS).
 // Slots with no reading come back as NAN. Returns the number of real samples.

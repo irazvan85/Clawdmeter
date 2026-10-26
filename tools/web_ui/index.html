@@ -137,6 +137,9 @@
   button:disabled { opacity: 0.4; cursor: not-allowed; }
   button:focus-visible, select:focus-visible, input:focus-visible { outline: 2px solid var(--text); outline-offset: 3px; }
   .stale { opacity: 0.4; }
+  .check-item { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--bar-bg); overflow-wrap: anywhere; }
+  .check-item p { margin: 4px 0; }
+  .check-item a { color: var(--accent); margin-right: 12px; }
   .settings-row {
     display: flex;
     align-items: center;
@@ -197,6 +200,18 @@
     </div>
 
     <div class="card">
+      <h2>Codex</h2>
+      <div class="row"><span class="k" id="codex-window-1">Primary</span><span class="v" id="codex-pct-1">--</span></div>
+      <div class="bar"><div id="codex-bar-1" style="width:0%"></div></div>
+      <p class="hint" id="codex-reset-1">--</p>
+      <div class="row"><span class="k" id="codex-window-2">Secondary</span><span class="v" id="codex-pct-2">--</span></div>
+      <div class="bar"><div id="codex-bar-2" style="width:0%"></div></div>
+      <p class="hint" id="codex-reset-2">--</p>
+      <div class="row"><span class="k">Plan</span><span class="v" id="codex-plan">--</span></div>
+      <p class="hint" id="codex-status">--</p>
+    </div>
+
+    <div class="card">
       <h2>Copilot</h2>
       <div class="pct" id="copilot-pct">--%</div>
       <div class="bar"><div id="copilot-bar" style="width:0%"></div></div>
@@ -230,6 +245,18 @@
       <div class="row"><span class="k">State</span><span class="v" id="ci-state">--</span></div>
       <div class="row"><span class="k">Branch</span><span class="v" id="ci-branch">--</span></div>
       <div class="row"><span class="k">Review</span><span class="v" id="ci-review">--</span></div>
+      <div class="hint" id="ci-count"></div>
+      <div id="ci-items"></div>
+    </div>
+
+    <div class="card">
+      <h2>Air</h2>
+      <div class="row"><span class="k">Quality</span><span class="v" id="air-level">--</span></div>
+      <div class="row"><span class="k">Rs/R0</span><span class="v" id="air-ratio">--</span></div>
+      <div class="row"><span class="k">Source</span><span class="v" id="air-hint">--</span></div>
+      <div class="hint" id="air-note"></div>
+      <div class="hint">Per-gas equivalents (ppm) of the one reading - they move together:</div>
+      <div id="air-gases"></div>
     </div>
 
     <div class="card">
@@ -260,6 +287,15 @@
         <div class="hint">Clock and Connectivity are always shown &mdash; they can't be hidden.</div>
         <button id="save-settings">Save settings</button>
         <div class="hint" id="settings-status"></div>
+        <div class="settings-row">
+          <span class="k">Air sensor</span>
+          <span>
+            <button id="gas-cal">Calibrate baseline</button>
+            <button id="gas-auto">Reset to auto</button>
+          </span>
+        </div>
+        <div class="hint">Calibrate only in fresh air (windows open 15+ min), after the sensor's 24-48 h burn-in. Same as a long-press on the device's Air screen.</div>
+        <div class="hint" id="gas-status"></div>
         <div class="hint">Token is remembered per-origin &mdash; re-enter it if you switch between an IP and clawdmeter.local.</div>
       </div>
     </div>
@@ -274,6 +310,23 @@ function dotClass(wifiState) {
 }
 
 function fmtPct(v) { return (v === null || v === undefined || v < 0) ? '--' : Math.round(v) + '%'; }
+
+function quotaWindow(minutes, fallback) {
+  if (!minutes || minutes < 0) return fallback;
+  if (minutes % 1440 === 0) return (minutes / 1440) + 'd window';
+  if (minutes % 60 === 0) return (minutes / 60) + 'h window';
+  return minutes + 'm window';
+}
+
+function codexReset(pct, reset, now) {
+  if (pct === undefined || pct < 0) return 'No quota data';
+  if (!reset) return 'Reset time unavailable';
+  const minutes = Math.ceil((reset - now) / 60);
+  if (minutes <= 0) return 'Awaiting refresh';
+  if (minutes < 60) return 'Resets in ' + minutes + 'm';
+  if (minutes < 1440) return 'Resets in ' + Math.floor(minutes / 60) + 'h ' + (minutes % 60) + 'm';
+  return 'Resets in ' + Math.floor(minutes / 1440) + 'd ' + Math.floor((minutes % 1440) / 60) + 'h';
+}
 
 async function refreshState() {
   let d;
@@ -306,6 +359,24 @@ async function refreshState() {
   document.getElementById('claude-act').textContent = act.state || '--';
 
   const cp = d.copilot || {};
+  const cx = d.codex || {};
+  const quotaNow = Math.floor(Date.now() / 1000);
+  const quotaAge = cx.ts ? Math.max(0, quotaNow - cx.ts) : 0;
+  const quotaStale = cx.st === 'stale' || (cx.ts && quotaAge >= 180);
+  for (let i = 1; i <= 2; i++) {
+    const pct = cx.valid ? cx['p' + i] : -1;
+    document.getElementById('codex-pct-' + i).textContent = fmtPct(pct);
+    document.getElementById('codex-window-' + i).textContent = quotaWindow(cx['w' + i], i === 1 ? 'Primary' : 'Secondary');
+    const bar = document.getElementById('codex-bar-' + i);
+    bar.style.width = Math.max(0, Math.min(100, pct || 0)) + '%';
+    bar.style.background = quotaStale ? 'var(--dim)' : 'var(--accent)';
+    document.getElementById('codex-reset-' + i).textContent = codexReset(pct, cx['r' + i], quotaNow);
+  }
+  document.getElementById('codex-plan').textContent = cx.plan || '--';
+  document.getElementById('codex-status').textContent = !cx.valid ? 'Waiting for Codex' : quotaStale ?
+    'Stale · last update ' + Math.floor(quotaAge / 60) + 'm ago' : cx.st === 'ok' ?
+    'Updated ' + quotaAge + 's ago' : cx.st === 'sign_in' ? 'Sign in to Codex' :
+    cx.st === 'missing' ? 'Codex executable not found' : 'Quota unavailable';
   document.getElementById('copilot-pct').textContent = cp.valid ? fmtPct(cp.premium_pct) : '--%';
   document.getElementById('copilot-bar').style.width = Math.max(0, Math.min(100, cp.premium_pct || 0)) + '%';
   document.getElementById('copilot-plan').textContent = cp.plan || '--';
@@ -330,7 +401,73 @@ async function refreshState() {
   const ci = d.ci || {};
   document.getElementById('ci-state').textContent = ci.valid ? ci.state : '--';
   document.getElementById('ci-branch').textContent = ci.valid ? ci.branch : '--';
-  document.getElementById('ci-review').textContent = ci.valid ? ci.review : '--';
+  document.getElementById('ci-review').textContent = ci.valid && ci.review_ok !== false ? ci.review : '--';
+  const checkItems = ci.valid && Array.isArray(ci.items) ? ci.items : [];
+  document.getElementById('ci-count').textContent = ci.total > checkItems.length ?
+    'Showing ' + checkItems.length + ' of ' + ci.total + ' items; highest priority first.' : '';
+  const checkList = document.getElementById('ci-items');
+  checkList.replaceChildren();
+  for (const item of checkItems) {
+    const box = document.createElement('div');
+    box.className = 'check-item';
+    const line = (text, className) => {
+      if (!text) return;
+      const p = document.createElement('p');
+      p.textContent = text;
+      if (className) p.className = className;
+      box.appendChild(p);
+    };
+    line([item.repo, item.pr ? 'PR #' + item.pr : 'Branch run', item.state].filter(Boolean).join(' · '));
+    line(item.title);
+    line([item.workflow, item.job, item.step ? 'Step: ' + item.step : ''].filter(Boolean).join(' / '));
+    line([item.branch, item.sha, item.age >= 0 ? item.age + 'm ago' : '',
+      item.failed > 0 ? item.failed + ' failed checks' : ''].filter(Boolean).join(' · '), 'hint');
+    for (const [label, value] of [['Open PR', item.pr_url], ['Open check / run', item.url]]) {
+      try {
+        const url = new URL(value);
+        if (url.protocol !== 'https:' || url.username || url.password) continue;
+        const a = document.createElement('a');
+        a.textContent = label;
+        a.href = url.href;
+        a.target = '_blank';
+        a.rel = 'noopener noreferrer';
+        box.appendChild(a);
+      } catch (_) { /* Missing or invalid links are omitted. */ }
+    }
+    checkList.appendChild(box);
+  }
+
+  const air = d.air || {};
+  const airLevel = air.saturated ? 'Off-scale'
+    : air.level ? air.level.charAt(0).toUpperCase() + air.level.slice(1) : '--';
+  document.getElementById('air-level').textContent =
+    !air.present ? '--' : air.warming ? 'Warming up' : airLevel;
+  document.getElementById('air-hint').textContent =
+    air.hint === 'spike' ? 'Sudden spike - VOC/alcohol?'
+      : air.hint === 'slow' ? 'Gradual - stale air?' : '--';
+  const gasBox = document.getElementById('air-gases');
+  gasBox.textContent = '';
+  const GAS_NAMES = { co2: 'CO2', nh3: 'NH3', alcohol: 'Alcohol', toluene: 'Toluene', acetone: 'Acetone', co: 'CO' };
+  Object.keys(GAS_NAMES).forEach(function (k) {
+    const g = (air.gases || {})[k];
+    const row = document.createElement('div');
+    row.className = 'row';
+    const kk = document.createElement('span');
+    kk.className = 'k';
+    kk.textContent = GAS_NAMES[k];
+    const vv = document.createElement('span');
+    vv.className = 'v';
+    vv.textContent = g && air.present && !air.warming ? String(Math.round(g.ppm)) + ' (' + g.level + ')' : '--';
+    row.appendChild(kk);
+    row.appendChild(vv);
+    gasBox.appendChild(row);
+  });
+  document.getElementById('air-ratio').textContent =
+    air.present ? (air.ratio.toFixed(2) + ' (' + (air.mv / 1000).toFixed(2) + ' V)') : '--';
+  document.getElementById('air-note').textContent =
+    !air.present ? 'No MQ-135 on GPIO 34'
+      : air.calibrated ? 'Baseline calibrated - not a CO alarm or CO2 meter'
+      : 'Auto baseline - run gascal in fresh air';
 
   const t = d.today || {};
   document.getElementById('today-min').textContent = t.valid ? (t.active_min + 'm') : '--';
@@ -376,7 +513,8 @@ document.getElementById('refresh-shot').addEventListener('click', refreshShot);
 // required here, not a duplicate.
 const SCREEN_NAMES = [
   'Splash', 'Clock', 'Sensor', 'Sensor Trend', 'Usage', 'Copilot',
-  'SysInfo', 'VS Code', 'Connectivity', 'Checks', 'Today', 'Aurora',
+  'SysInfo', 'VS Code', 'Connectivity', 'Checks', 'Today', 'Aurora', 'Codex',
+  'Air', 'Gases',
 ];
 
 function populateScreenMenu() {
@@ -443,6 +581,9 @@ const CFG_SCREENS = [
   { bit: 7, label: 'VS Code' },
   { bit: 9, label: 'Checks' },
   { bit: 10, label: 'Today' },
+  { bit: 11, label: 'Codex' },
+  { bit: 12, label: 'Air' },
+  { bit: 13, label: 'Gases' },
 ];
 
 // GET /api/state deliberately never exposes the auth token (it's an open
@@ -534,6 +675,36 @@ document.getElementById('save-settings').addEventListener('click', async functio
     status.textContent = 'Save failed — device unreachable.';
   }
 });
+
+async function postGas(action) {
+  const status = document.getElementById('gas-status');
+  try {
+    const r = await fetch('/api/gas', {
+      method: 'POST',
+      headers: { 'X-Auth-Token': getToken() },
+      body: new URLSearchParams({ action: action }),
+    });
+    if (r.status === 401) {
+      clearToken();
+      updateLockUI();
+      status.textContent = 'Token rejected - unlock again.';
+      return;
+    }
+    const res = await r.json();
+    status.textContent =
+      res.result === 'ok' ? (res.calibrated ? 'Baseline set to the current air.' : 'Baseline back to auto-tracking.')
+        : res.result === 'warming' ? 'Sensor still warming up - try again in a few minutes.'
+        : 'No sensor reading on GPIO 34.';
+    refreshState();
+  } catch (e) {
+    status.textContent = 'Request failed - device unreachable.';
+  }
+}
+
+document.getElementById('gas-cal').addEventListener('click', function () {
+  if (confirm('Set the clean-air baseline to the air around the sensor right now?')) postGas('cal');
+});
+document.getElementById('gas-auto').addEventListener('click', function () { postGas('auto'); });
 
 updateLockUI();
 if (getToken()) {

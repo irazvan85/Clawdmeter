@@ -7,6 +7,7 @@
 #include "power.h"
 #include "imu.h"
 #include "env_sensor.h"
+#include "gas_sensor.h"
 #include "sensor_hist.h"
 #include "usage_hist.h"
 #include "splash.h"
@@ -34,6 +35,7 @@ Arduino_ST7789  *gfx = new Arduino_ST7789(
     LCD_WIDTH, LCD_HEIGHT, 52, 40);
 
 static UsageData usage = {};
+static CodexData codex = {};
 static CopilotData copilot = {};
 static SysInfoData sysinfo = {};
 static VscodeData vscode = {};
@@ -115,7 +117,7 @@ bool capture_screenshot_streamed(screenshot_tile_cb cb) {
 // Dispatching is done at the call site in loop().
 
 // Serial command buffer
-#define CMD_BUF_SIZE 256
+#define CMD_BUF_SIZE 1024
 static char cmd_buf[CMD_BUF_SIZE];
 static int cmd_pos = 0;
 
@@ -142,6 +144,21 @@ static bool process_payload(const char* raw) {
     const char* src = doc["src"] | "claude";
     if (strcmp(src, "status") == 0) {
         ui_update_daemon_state(doc["state"] | "ok");
+    } else if (strcmp(src, "codex") == 0) {
+        codex.pct[0] = doc["p1"] | -1.0f;
+        codex.pct[1] = doc["p2"] | -1.0f;
+        codex.window_min[0] = doc["w1"] | 0;
+        codex.window_min[1] = doc["w2"] | 0;
+        codex.reset_at[0] = doc["r1"] | 0L;
+        codex.reset_at[1] = doc["r2"] | 0L;
+        codex.sampled_at = doc["ts"] | 0L;
+        codex.sample_age = doc["age"] | 0;
+        strlcpy(codex.status, doc["st"] | "unavailable", sizeof(codex.status));
+        strlcpy(codex.plan, doc["plan"] | "", sizeof(codex.plan));
+        strlcpy(codex.bucket, doc["bucket"] | "codex", sizeof(codex.bucket));
+        codex.valid = true;
+        doc.clear();
+        ui_update_codex(&codex);
     } else if (strcmp(src, "copilot") == 0) {
         copilot.premium_pct        = doc["pp"]  | -1;
         copilot.premium_remaining  = doc["pr"]  | -1;
@@ -184,7 +201,30 @@ static bool process_payload(const char* raw) {
         cid.ahead    = doc["ah"]  | 0;
         cid.behind   = doc["bh"]  | 0;
         cid.conflict = doc["cf"]  | false;
+        cid.review_ok = doc["review_ok"] | true;
+        cid.item_count = 0;
+        for (JsonObjectConst item : doc["items"].as<JsonArrayConst>()) {
+            if (cid.item_count >= CI_MAX_ITEMS) break;
+            CiItem& dst = cid.items[cid.item_count++];
+            strlcpy(dst.state, item["state"] | "none", sizeof(dst.state));
+            strlcpy(dst.repo, item["repo"] | "", sizeof(dst.repo));
+            strlcpy(dst.title, item["title"] | "", sizeof(dst.title));
+            strlcpy(dst.branch, item["branch"] | "", sizeof(dst.branch));
+            strlcpy(dst.sha, item["sha"] | "", sizeof(dst.sha));
+            strlcpy(dst.workflow, item["workflow"] | "", sizeof(dst.workflow));
+            strlcpy(dst.job, item["job"] | "", sizeof(dst.job));
+            strlcpy(dst.step, item["step"] | "", sizeof(dst.step));
+            strlcpy(dst.url, item["url"] | "", sizeof(dst.url));
+            strlcpy(dst.pr_url, item["pr_url"] | "", sizeof(dst.pr_url));
+            dst.pr = item["pr"] | 0;
+            dst.age_min = item["age"] | -1;
+            dst.failed = item["failed"] | 0;
+        }
+        cid.total = doc["total"] | cid.item_count;
         cid.valid = true;
+        // All fields are copied now. Free the larger Checks document before
+        // lazy LVGL creation/text allocation fragments these temporary blocks.
+        doc.clear();
         ui_update_ci(&cid);
     } else if (strcmp(src, "sum") == 0) {
         todayd.active_min = doc["am"]  | 0;
@@ -242,6 +282,41 @@ static bool process_payload(const char* raw) {
 // GET /api/state (web_server.cpp) — dump everything the device currently
 // holds, from the same structs process_payload() above populates.
 void build_state_json(JsonDocument& doc) {
+    {
+        AirData a = {};
+        bool ok = gas_sensor_get(&a);
+        static const char* const LEVELS[] = { "good", "fair", "poor", "bad" };
+        static const char* const HINTS[]  = { "", "spike", "slow" };
+        JsonObject air = doc["air"].to<JsonObject>();
+        air["present"]    = ok && a.present;
+        air["warming"]    = a.warming;
+        air["calibrated"] = a.calibrated;
+        air["mv"]         = a.mv;
+        air["ratio"]      = roundf(a.ratio * 1000) / 1000;
+        air["level"]      = LEVELS[a.level];
+        air["saturated"]  = a.saturated;
+        air["hint"]       = HINTS[a.hint];
+        // Per-gas equivalents of the one reading -- see gas_sensor.h.
+        JsonObject gases = air["gases"].to<JsonObject>();
+        for (int i = 0; i < AIR_GAS_COUNT; i++) {
+            JsonObject g = gases[GAS_DEFS[i].key].to<JsonObject>();
+            g["ppm"]   = roundf(a.gas_ppm[i] * 10) / 10;
+            g["level"] = LEVELS[a.gas_level[i]];
+        }
+    }
+    JsonObject cx = doc["codex"].to<JsonObject>();
+    cx["p1"] = codex.pct[0];
+    cx["p2"] = codex.pct[1];
+    cx["w1"] = codex.window_min[0];
+    cx["w2"] = codex.window_min[1];
+    cx["r1"] = codex.reset_at[0];
+    cx["r2"] = codex.reset_at[1];
+    cx["ts"] = codex.sampled_at;
+    cx["age"] = codex.sample_age;
+    cx["st"] = codex.status;
+    cx["plan"] = codex.plan;
+    cx["bucket"] = codex.bucket;
+    cx["valid"] = codex.valid;
     JsonObject claude = doc["claude"].to<JsonObject>();
     claude["session_pct"]        = usage.session_pct;
     claude["session_reset_mins"] = usage.session_reset_mins;
@@ -312,6 +387,26 @@ void build_state_json(JsonDocument& doc) {
     ci["ahead"]    = cid.ahead;
     ci["behind"]   = cid.behind;
     ci["conflict"] = cid.conflict;
+    ci["review_ok"] = cid.review_ok;
+    ci["total"] = cid.total;
+    JsonArray ci_items = ci["items"].to<JsonArray>();
+    for (int i = 0; i < cid.item_count; ++i) {
+        const CiItem& src = cid.items[i];
+        JsonObject item = ci_items.add<JsonObject>();
+        item["state"] = src.state;
+        item["repo"] = src.repo;
+        item["title"] = src.title;
+        item["branch"] = src.branch;
+        item["sha"] = src.sha;
+        item["workflow"] = src.workflow;
+        item["job"] = src.job;
+        item["step"] = src.step;
+        item["url"] = src.url;
+        item["pr_url"] = src.pr_url;
+        item["pr"] = src.pr;
+        item["age"] = src.age_min;
+        item["failed"] = src.failed;
+    }
     ci["valid"]    = cid.valid;
 
     JsonObject today = doc["today"].to<JsonObject>();
@@ -442,6 +537,16 @@ static void check_serial_cmd() {
                 env_sensor_scan_bus();
             } else if (strcmp(cmd_buf, "gpiotest") == 0) {
                 env_sensor_gpio_test();
+            } else if (strcmp(cmd_buf, "gas") == 0) {
+                gas_sensor_print();
+            } else if (strcmp(cmd_buf, "gascal") == 0) {
+                // Run in fresh air (window open / outdoors), after burn-in.
+                Serial.println(gas_sensor_calibrate(true) == GAS_CAL_OK
+                                   ? "gas baseline set" : "gas: no sensor reading");
+                gas_sensor_print();
+            } else if (strcmp(cmd_buf, "gasauto") == 0) {
+                gas_sensor_auto();
+                Serial.println("gas baseline back to auto-tracking");
             } else if (strcmp(cmd_buf, "histclear") == 0) {
                 sensor_hist_clear();
                 Serial.println("sensor history cleared");
@@ -490,6 +595,12 @@ void setup() {
     // draws the trend graphs from it.
     sensor_hist_init();
     usage_hist_init();
+
+    // MQ-135 on GPIO 34 (ADC1). Just an ADC attenuation setting plus one
+    // small NVS read for the stored baseline -- same early-boot NVS slot as
+    // the opens above. Its screen is built lazily, only once a reading shows
+    // something is actually wired to the pin.
+    gas_sensor_init();
 
     // Loads the persisted theme/visibility settings (Preferences NVS open,
     // same class of call as the two just above) and sets g_theme -- must run
@@ -562,6 +673,7 @@ void loop() {
     power_tick();
     imu_tick();
     env_sensor_tick();
+    gas_sensor_tick();
     sensor_hist_tick();
     usage_hist_tick();
     splash_tick();
@@ -578,7 +690,8 @@ void loop() {
     //                       second one landing within DOUBLE_PRESS_MS just
     //                       redirects straight to Clock.
     //   Long press        → Connectivity screen: forget the stored WiFi
-    //                       network; Clock: toggle focus timer; any other
+    //                       network; Clock: toggle focus timer; Air: set the
+    //                       MQ-135 clean-air baseline (gascal); any other
     //                       screen: no effect beyond the flash feedback
     //                       (used to ask the daemon for an immediate poll
     //                       over BLE — dropped when BLE was removed, see
@@ -609,6 +722,13 @@ void loop() {
                 wifi_set_credentials("", "");   // "forget this network"
             } else if (cs == SCREEN_CLOCK) {
                 ui_timer_toggle();   // start/stop the focus timer (flashes itself)
+            } else if (cs == SCREEN_AIR) {
+                // Calibrate the MQ-135 baseline to the air right now.
+                ui_flash_feedback_strong();
+                GasCalResult r = gas_sensor_calibrate(false);
+                ui_show_notice(r == GAS_CAL_OK      ? "Baseline set"
+                             : r == GAS_CAL_WARMING ? "Still warming"
+                                                    : "No sensor", r == GAS_CAL_OK);
             } else {
                 ui_flash_feedback_strong();
             }
@@ -671,6 +791,23 @@ void loop() {
         if (s_present && (hist_ms == 0 || millis() - hist_ms >= 10000)) {
             hist_ms = millis();
             sensor_hist_sample(s_t, s_has_h, s_h, s_p);
+        }
+    }
+
+    // MQ-135: refresh the UI every 2 s (the reading is smoothed once a
+    // second, so faster just churns labels) and log to history every 10 s,
+    // same cadence as the env sensor above. Warm-up readings aren't logged:
+    // a cold heater reads as wildly polluted air.
+    {
+        static uint32_t ui_ms = 0, hist_ms = 0;
+        AirData air;
+        if (millis() - ui_ms >= 2000 && gas_sensor_get(&air)) {
+            ui_ms = millis();
+            ui_update_air(&air);
+            if (air.present && !air.warming && millis() - hist_ms >= 10000) {
+                hist_ms = millis();
+                sensor_hist_sample_aq(air.ratio);
+            }
         }
     }
 

@@ -13,6 +13,16 @@ struct UsageData {
     bool valid;              // false until first successful parse
 };
 
+struct CodexData {
+    float pct[2];
+    int window_min[2];
+    long reset_at[2];
+    long sampled_at;
+    int sample_age;
+    char status[12], plan[24], bucket[32];
+    bool valid;
+};
+
 struct CopilotData {
     int premium_pct;          // 0-100, % of monthly premium requests USED, -1 if unavailable
     int premium_remaining;    // requests remaining this month, -1 if unavailable
@@ -45,8 +55,18 @@ struct VscodeData {
     bool valid;         // false until first successful parse
 };
 
+constexpr int CI_MAX_ITEMS = 4;
+
+struct CiItem {
+    char state[12];
+    char repo[80], title[96], branch[64], sha[9];
+    char workflow[80], job[80], step[80];
+    char url[192], pr_url[192];
+    int pr, age_min, failed;
+};
+
 struct CiData {
-    char state[10];    // "pass" | "fail" | "running" | "none"
+    char state[10];    // summary; CiItem also distinguishes review/changes/cancelled
     char wf[20];       // workflow name
     char branch[24];   // branch the run/repo is on
     int  age_min;      // minutes since the run finished/started; -1 unknown
@@ -55,6 +75,9 @@ struct CiData {
     int  dirty;        // changed files in the working tree; -1 unknown
     int  ahead, behind;
     bool conflict;
+    bool review_ok;
+    int item_count, total;
+    CiItem items[CI_MAX_ITEMS];
     bool valid;
 };
 
@@ -86,4 +109,31 @@ struct AuroraData {
     int  cloud_pct;      // 0-100 cloud cover at the same location, -1 if unknown
     bool night;          // false = daylight (aurora won't be visible regardless of pct)
     bool valid;          // false until first successful parse
+};
+
+// MQ-135 air-quality reading — on-device (gas_sensor.cpp, ADC on GPIO 34),
+// not a daemon payload. Filled by gas_sensor_get(), pushed to the UI by main.cpp.
+enum AirLevel { AIR_GOOD, AIR_FAIR, AIR_POOR, AIR_BAD };
+
+// Heuristic guess at what's behind a drop, from how fast it happened. Not a
+// measurement -- the MQ-135 can't tell gases apart.
+enum AirHint { AIR_HINT_NONE, AIR_HINT_SPIKE, AIR_HINT_SLOW };
+
+// Order of AirData::gas_ppm[] / gas_level[], and of GAS_DEFS[] in gas_sensor.cpp.
+enum AirGas { GAS_CO2, GAS_NH3, GAS_ALCOHOL, GAS_TOLUENE, GAS_ACETONE, GAS_CO, AIR_GAS_COUNT };
+
+struct AirData {
+    bool     present;      // false = nothing on the pin (reads ~0 V)
+    bool     warming;      // heater still settling after boot; numbers not trusted yet
+    int      warm_left_s;  // seconds of warm-up remaining (0 once warm)
+    bool     calibrated;   // baseline set by `gascal`, not auto-tracked
+    int      mv;           // sensor output, mV at the module's S pin (divider undone)
+    float    ratio;        // Rs / R0 — 1.0 = baseline clean air, lower = dirtier
+    AirLevel level;        // from ratio alone — gas-agnostic headline
+    bool     saturated;    // output pinned at the ADC/supply ceiling — off-scale
+    AirHint  hint;
+    // Per-gas *equivalents*: what each gas would read if it alone caused the
+    // drop. One sensor, one reading -- these move together, not independently.
+    float    gas_ppm[AIR_GAS_COUNT];
+    AirLevel gas_level[AIR_GAS_COUNT];
 };

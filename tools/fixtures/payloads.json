@@ -1,11 +1,12 @@
 {
   "_comment": "One representative payload per `src` the firmware's process_payload() (firmware/src/main.cpp) understands. Used by tools/perf_check.py to populate every lazily-built screen before measuring it, and by tools/tests/test_payload_contract.py to check the daemon emits the same keys. Keep keys in sync with process_payload().",
   "claude":  {"src": "claude", "s": 42.0, "sr": 133, "w": 67.0, "wr": 4200, "st": "allowed", "mdl": "opus", "ctx": 35, "ok": true},
+  "codex":   {"src": "codex", "p1": 45, "w1": 300, "r1": 1792363511, "p2": 7, "w2": 10080, "r2": 1792950311, "st": "ok", "ts": 1792357200, "age": 0, "plan": "team", "bucket": "codex"},
   "copilot": {"src": "copilot", "pp": 58, "pr": 126, "pe": 300, "prm": 9000, "prd": "Nov 1", "plan": "Pro", "en": true},
   "sysinfo": {"src": "sysinfo", "cpu": 23, "ct": 54.5, "rp": 61, "ru": 19.5, "rt": 32.0, "dp": 71, "du": 680.0, "dt": 953.0},
   "vscode":  {"src": "vscode", "mm": 2140, "vc": 12, "xe": 3, "ec": 1, "le": "TS server restarted"},
   "act":     {"src": "act", "st": "working", "n": 2},
-  "ci":      {"src": "ci", "state": "pass", "wf": "build", "br": "main", "age": 17, "rev": 1, "chg": 4, "dty": 4, "ah": 1, "bh": 0, "cf": false},
+  "ci":      {"src": "ci", "state": "fail", "wf": "CI", "br": "main", "age": 4, "rev": 1, "chg": 1, "dty": 4, "ah": 1, "bh": 0, "cf": false, "review_ok": true, "total": 1, "items": [{"state": "fail", "repo": "owner/clawdmeter", "pr": 142, "title": "Fix WiFi discovery", "branch": "fix/discovery", "sha": "a1b2c3d4", "workflow": "CI", "job": "Windows tests", "step": "Run pytest", "age": 4, "failed": 2, "url": "https://github.com/owner/clawdmeter/actions/runs/123/job/456", "pr_url": "https://github.com/owner/clawdmeter/pull/142"}]},
   "sum":     {"src": "sum", "am": 185, "tk": 912, "usd": 7, "cm": 6, "cp": 14},
   "env":     {"src": "env", "ts": 1791000000, "tz": 180, "tp": 14, "th": 18, "tl": 9, "tc": 2, "tn": "Bucharest"},
   "aurora":  {"src": "aurora", "ts": 1791000000, "pct": 12, "kp": 43, "kpmax": 57, "cloud": 40, "night": 1},

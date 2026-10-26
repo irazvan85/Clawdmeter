@@ -11,6 +11,7 @@
 #include "sensor_hist.h"
 #include "usage_hist.h"
 #include "device_config.h"
+#include "gas_sensor.h"
 
 // Custom fonts (scaled for 135x240 1.14" IPS)
 LV_FONT_DECLARE(font_tiempos_34);
@@ -480,7 +481,7 @@ static void make_usage_panel(lv_obj_t* parent, int y, const char* pill_text,
     // that with room to spare. Deliberately not the green/amber/red status
     // palette (the bar above already carries that signal) — a neutral trace
     // color so the two aren't read as disagreeing.
-    make_usage_spark(panel, spark_col, out_spark);
+    if (out_spark) make_usage_spark(panel, spark_col, out_spark);
 }
 
 // Copilot panel: 60px tall (bar at y=22, detail label at y=36).
@@ -537,6 +538,88 @@ static void init_usage_screen(lv_obj_t* scr) {
     lv_label_set_long_mode(lbl_anim, LV_LABEL_LONG_DOT);
     lv_obj_set_style_text_align(lbl_anim, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_align(lbl_anim, LV_ALIGN_BOTTOM_MID, 0, -8);
+}
+
+// ======== Codex quotas (same panels, no history allocation) ========
+
+static lv_obj_t* codex_container;
+static lv_obj_t* codex_pct[2];
+static lv_obj_t* codex_window[2];
+static lv_obj_t* codex_bar[2];
+static lv_obj_t* codex_reset[2];
+static lv_obj_t* lbl_codex_plan;
+static lv_obj_t* lbl_codex_status;
+static const CodexData* codex_data = nullptr;
+static uint32_t codex_rx_ms;
+static bool codex_has_data = false;
+
+static void init_codex_screen(lv_obj_t* scr) {
+    codex_container = make_screen_container(scr, "Codex");
+    lbl_codex_plan = lv_label_create(codex_container);
+    lv_obj_set_pos(lbl_codex_plan, MARGIN, 28);
+    lv_obj_set_width(lbl_codex_plan, CONTENT_W);
+    lv_label_set_long_mode(lbl_codex_plan, LV_LABEL_LONG_CLIP);
+    lv_obj_set_style_text_font(lbl_codex_plan, &font_styrene_12, 0);
+    lv_obj_set_style_text_color(lbl_codex_plan, COL_DIM, 0);
+    for (int i = 0; i < 2; ++i) {
+        make_usage_panel(codex_container, CONTENT_Y + i * (PANEL_H + PANEL_GAP),
+                         i ? "Long" : "Short", COL_ACCENT, &codex_pct[i],
+                         &codex_window[i], &codex_bar[i], &codex_reset[i], nullptr);
+    }
+    lbl_codex_status = lv_label_create(codex_container);
+    lv_obj_set_pos(lbl_codex_status, MARGIN, 214);
+    lv_obj_set_width(lbl_codex_status, CONTENT_W);
+    lv_obj_set_style_text_font(lbl_codex_status, &font_styrene_12, 0);
+    lv_obj_set_style_text_color(lbl_codex_status, COL_DIM, 0);
+    lv_obj_add_flag(codex_container, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void refresh_codex() {
+    if (!codex_data || !codex_container) return;
+    const CodexData& data = *codex_data;
+    uint32_t elapsed = (lv_tick_get() - codex_rx_ms) / 1000;
+    long age = (data.sample_age > 0 ? data.sample_age : 0) + (long)elapsed;
+    long now = data.sampled_at + age;
+    bool stale = strcmp(data.status, "stale") == 0 || (data.sampled_at > 0 && age >= 180);
+    lv_label_set_text(lbl_codex_plan, data.plan[0] ? data.plan : data.bucket);
+    char b[40];
+    for (int i = 0; i < 2; ++i) {
+        int duration = data.window_min[i];
+        if (duration > 0 && duration % 1440 == 0) snprintf(b, sizeof(b), "%dd", duration / 1440);
+        else if (duration > 0 && duration % 60 == 0) snprintf(b, sizeof(b), "%dh", duration / 60);
+        else if (duration > 0) snprintf(b, sizeof(b), "%dm", duration);
+        else snprintf(b, sizeof(b), "%s", i ? "Long" : "Short");
+        lv_label_set_text(codex_window[i], b);
+        bool known = isfinite(data.pct[i]) && data.pct[i] >= 0 && data.pct[i] <= 100;
+        int pct = known ? (int)roundf(data.pct[i]) : 0;
+        if (known) lv_label_set_text_fmt(codex_pct[i], "%d%%", pct);
+        else lv_label_set_text(codex_pct[i], "---%");
+        lv_bar_set_value(codex_bar[i], pct, LV_ANIM_OFF);
+        lv_obj_set_style_bg_color(codex_bar[i], known && !stale ? pct_color(pct) : COL_DIM, LV_PART_INDICATOR);
+        if (!known) snprintf(b, sizeof(b), "No quota data");
+        else if (!data.reset_at[i] || !data.sampled_at) snprintf(b, sizeof(b), "Reset unknown");
+        else if (data.reset_at[i] <= now) snprintf(b, sizeof(b), "Awaiting refresh");
+        else format_reset_time((data.reset_at[i] - now + 59) / 60, b, sizeof(b));
+        lv_label_set_text(codex_reset[i], b);
+    }
+    if (stale) snprintf(b, sizeof(b), "Stale %ldm", age / 60);
+    else if (!strcmp(data.status, "sign_in")) snprintf(b, sizeof(b), "Sign in to Codex");
+    else if (!strcmp(data.status, "missing")) snprintf(b, sizeof(b), "Codex not found");
+    else if (strcmp(data.status, "ok")) snprintf(b, sizeof(b), "Quota unavailable");
+    else if (age < 60) snprintf(b, sizeof(b), "Updated %lds ago", age);
+    else snprintf(b, sizeof(b), "Updated %ldm ago", age / 60);
+    lv_label_set_text(lbl_codex_status, b);
+    lv_obj_set_style_text_color(lbl_codex_status, stale ? COL_AMBER : COL_DIM, 0);
+}
+
+void ui_update_codex(const CodexData* data) {
+    if (!data->valid) return;
+    if (!codex_has_data) init_codex_screen(lv_screen_active());
+    codex_has_data = true;
+    codex_data = data;
+    codex_rx_ms = lv_tick_get();
+    note_data();
+    refresh_codex();
 }
 
 // ======== Copilot Screen (135x240) ========
@@ -679,6 +762,12 @@ static void timer_start_phase(tmr_state_t phase) {
     banner_show(BANNER_TIMER, phase == TMR_FOCUS ? "Focus" : "Break time",
                 COL_ACCENT, COL_BG, 4000);   // transient — unlike "needs you"
     ui_flash_feedback_strong();
+}
+
+// Transient confirmation for a long-press action. Shares the timer's banner
+// slot: both are short-lived and lower priority than alerts / "needs you".
+void ui_show_notice(const char* text, bool ok) {
+    banner_show(BANNER_TIMER, text, ok ? COL_GREEN : COL_AMBER, COL_BG, 3000);
 }
 
 void ui_timer_toggle(void) {
@@ -1093,91 +1182,109 @@ static void init_bluetooth_screen(lv_obj_t* scr) {
 // ======== Checks Screen (CI + review queue + git) ========
 
 static lv_obj_t* ci_container;
-static lv_obj_t* ci_dot;
 static lv_obj_t* lbl_ci_state;
-static lv_obj_t* lbl_ci_wf;
-static lv_obj_t* lbl_ci_pr;
-static lv_obj_t* dot_ci_branch;    // small marker before the branch name — a
-                                    // visual anchor so the git row isn't just
-                                    // a wall of abbreviated text
+static lv_obj_t* lbl_ci_page;
+static lv_obj_t* lbl_ci_repo;
+static lv_obj_t* lbl_ci_identity;
+static lv_obj_t* lbl_ci_title;
+static lv_obj_t* lbl_ci_workflow;
+static lv_obj_t* lbl_ci_job;
+static lv_obj_t* lbl_ci_step;
 static lv_obj_t* lbl_ci_branch;
-static lv_obj_t* pill_ci_dirty;    // "N chg", amber, hidden when clean
-static lv_obj_t* pill_ci_ahead;    // "+N", green, hidden when 0
-static lv_obj_t* pill_ci_behind;   // "-N", dim, hidden when 0
+static lv_obj_t* lbl_ci_footer;
 static bool ci_has_data = false;
+// main.cpp owns this stable struct; avoid duplicating the bounded item array.
+static const CiData* ci_data = nullptr;
+static int ci_page = 0;
+static uint32_t ci_page_ms = 0;
+
+static lv_obj_t* ci_label(int y, const lv_font_t* font, int height = 16) {
+    lv_obj_t* label = lv_label_create(ci_container);
+    lv_obj_set_pos(label, MARGIN, y);
+    lv_obj_set_size(label, CONTENT_W, height);
+    lv_label_set_text(label, "");
+    lv_obj_set_style_text_font(label, font, 0);
+    lv_obj_set_style_text_color(label, COL_DIM, 0);
+    lv_label_set_long_mode(label, height > 20 ? LV_LABEL_LONG_DOT : LV_LABEL_LONG_SCROLL_CIRCULAR);
+    lv_obj_set_style_anim_duration(label, 5500, 0);
+    return label;
+}
 
 static void init_ci_screen(lv_obj_t* scr) {
     ci_container = make_screen_container(scr, "Checks");
-
-    ci_dot = lv_obj_create(ci_container);
-    lv_obj_set_size(ci_dot, 24, 24);
-    lv_obj_set_style_radius(ci_dot, LV_RADIUS_CIRCLE, 0);
-    lv_obj_set_style_border_width(ci_dot, 0, 0);
-    lv_obj_set_style_bg_color(ci_dot, COL_DIM, 0);
-    lv_obj_set_style_bg_opa(ci_dot, LV_OPA_COVER, 0);
-    lv_obj_clear_flag(ci_dot, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_pos(ci_dot, MARGIN + 4, CONTENT_Y + 4);
-
-    lbl_ci_state = lv_label_create(ci_container);
-    lv_label_set_text(lbl_ci_state, "No runs");
-    lv_obj_set_style_text_font(lbl_ci_state, &font_styrene_24, 0);
-    lv_obj_set_style_text_color(lbl_ci_state, COL_TEXT, 0);
-    lv_obj_set_pos(lbl_ci_state, MARGIN + 38, CONTENT_Y);
-
-    lbl_ci_wf = lv_label_create(ci_container);
-    lv_label_set_text(lbl_ci_wf, "");
-    lv_obj_set_style_text_font(lbl_ci_wf, &font_styrene_12, 0);
-    lv_obj_set_style_text_color(lbl_ci_wf, COL_DIM, 0);
-    lv_obj_set_pos(lbl_ci_wf, MARGIN + 38, CONTENT_Y + 26);
-
-    lv_obj_t* rule = lv_obj_create(ci_container);
-    lv_obj_set_size(rule, CONTENT_W - 24, 2);
-    lv_obj_align(rule, LV_ALIGN_TOP_MID, 0, CONTENT_Y + 52);
-    lv_obj_set_style_bg_color(rule, COL_BAR_BG, 0);
-    lv_obj_set_style_bg_opa(rule, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_width(rule, 0, 0);
-    lv_obj_set_style_radius(rule, 0, 0);
-    lv_obj_clear_flag(rule, LV_OBJ_FLAG_SCROLLABLE);
-
-    lbl_ci_pr = lv_label_create(ci_container);
-    lv_label_set_text(lbl_ci_pr, "");
-    lv_obj_set_style_text_font(lbl_ci_pr, &font_styrene_14, 0);
-    lv_obj_set_style_text_color(lbl_ci_pr, COL_TEXT, 0);
-    lv_obj_set_pos(lbl_ci_pr, MARGIN, CONTENT_Y + 66);
-
-    // Git working-tree row: a small marker + branch name, then compact
-    // status chips below — replaces one dense "main 4 chg +1 -0" line with
-    // scannable, color-coded pieces (dirty=amber, ahead=green, behind=dim).
-    dot_ci_branch = lv_obj_create(ci_container);
-    lv_obj_set_size(dot_ci_branch, 6, 6);
-    lv_obj_set_style_radius(dot_ci_branch, LV_RADIUS_CIRCLE, 0);
-    lv_obj_set_style_border_width(dot_ci_branch, 0, 0);
-    lv_obj_set_style_bg_color(dot_ci_branch, COL_DIM, 0);
-    lv_obj_set_style_bg_opa(dot_ci_branch, LV_OPA_COVER, 0);
-    lv_obj_clear_flag(dot_ci_branch, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_pos(dot_ci_branch, MARGIN + 1, CONTENT_Y + 96);
-
-    lbl_ci_branch = lv_label_create(ci_container);
-    lv_label_set_text(lbl_ci_branch, "");
-    lv_obj_set_style_text_font(lbl_ci_branch, &font_styrene_12, 0);
-    lv_obj_set_style_text_color(lbl_ci_branch, COL_TEXT, 0);
-    lv_obj_set_pos(lbl_ci_branch, MARGIN + 13, CONTENT_Y + 92);
-
-    // Fixed 42px chip slots — a hidden chip just leaves a gap, which reads
-    // fine for a status row (same idiom as CI check badges elsewhere).
-    pill_ci_dirty = make_pill(ci_container, "");
-    lv_obj_set_pos(pill_ci_dirty, MARGIN, CONTENT_Y + 112);
-    lv_obj_add_flag(pill_ci_dirty, LV_OBJ_FLAG_HIDDEN);
-
-    pill_ci_ahead = make_pill(ci_container, "");
-    lv_obj_set_pos(pill_ci_ahead, MARGIN + 42, CONTENT_Y + 112);
-    lv_obj_add_flag(pill_ci_ahead, LV_OBJ_FLAG_HIDDEN);
-
-    pill_ci_behind = make_pill(ci_container, "");
-    lv_obj_set_pos(pill_ci_behind, MARGIN + 84, CONTENT_Y + 112);
-    lv_obj_add_flag(pill_ci_behind, LV_OBJ_FLAG_HIDDEN);
-
+    lbl_ci_state = ci_label(40, &font_styrene_16, 22);
+    lv_obj_set_width(lbl_ci_state, 87);
+    lbl_ci_page = ci_label(43, &font_styrene_12);
+    lv_obj_set_pos(lbl_ci_page, 96, 43);
+    lv_obj_set_width(lbl_ci_page, 33);
+    lv_obj_set_style_text_align(lbl_ci_page, LV_TEXT_ALIGN_RIGHT, 0);
+    lbl_ci_repo = ci_label(64, &font_styrene_12);
+    lbl_ci_identity = ci_label(82, &font_styrene_16, 22);
+    lbl_ci_title = ci_label(105, &font_styrene_12, 30);
+    lv_label_set_long_mode(lbl_ci_title, LV_LABEL_LONG_WRAP);
+    lbl_ci_workflow = ci_label(140, &font_styrene_12);
+    lbl_ci_job = ci_label(158, &font_styrene_12);
+    lbl_ci_step = ci_label(176, &font_styrene_12);
+    lbl_ci_branch = ci_label(196, &font_styrene_12);
+    lbl_ci_footer = ci_label(216, &font_styrene_12);
+    lv_obj_set_style_text_color(lbl_ci_identity, COL_TEXT, 0);
+    lv_obj_set_style_text_color(lbl_ci_title, COL_TEXT, 0);
+    lv_obj_set_style_text_color(lbl_ci_job, COL_TEXT, 0);
     lv_obj_add_flag(ci_container, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void render_ci_page() {
+    if (!ci_data || !ci_container) return;
+    const CiData& data = *ci_data;
+    const CiItem* item = data.item_count ? &data.items[ci_page % data.item_count] : nullptr;
+    const char* state = item ? item->state : data.state;
+    const char* title = "No runs";
+    lv_color_t color = COL_DIM;
+    if (!strcmp(state, "fail")) { title = "Failed"; color = COL_RED; }
+    else if (!strcmp(state, "pass")) { title = "Passing"; color = COL_GREEN; }
+    else if (!strcmp(state, "running")) { title = "Running"; color = COL_AMBER; }
+    else if (!strcmp(state, "cancelled")) { title = "Cancelled"; color = COL_AMBER; }
+    else if (!strcmp(state, "changes")) { title = "Changes"; color = COL_AMBER; }
+    else if (!strcmp(state, "review")) { title = "Review"; color = COL_ACCENT; }
+    else if (!strcmp(state, "unknown")) title = "Unavailable";
+    lv_label_set_text(lbl_ci_state, title);
+    lv_obj_set_style_text_color(lbl_ci_state, color, 0);
+    char b[160];
+    if (item) snprintf(b, sizeof(b), "%d/%d%s", ci_page + 1, data.item_count, data.total > data.item_count ? "+" : "");
+    else b[0] = '\0';
+    lv_label_set_text(lbl_ci_page, b);
+    lv_label_set_text(lbl_ci_repo, item ? item->repo : "");
+    if (item && item->pr > 0) snprintf(b, sizeof(b), "PR #%d", item->pr);
+    else snprintf(b, sizeof(b), "%s", !strcmp(state, "unknown") ? "GitHub / gh" : "Branch run");
+    lv_label_set_text(lbl_ci_identity, b);
+    lv_label_set_text(lbl_ci_title, item ? item->title : data.wf);
+    lv_label_set_text(lbl_ci_workflow, item ? item->workflow : "");
+    lv_label_set_text(lbl_ci_job, item ? item->job : "");
+    if (item && item->step[0]) snprintf(b, sizeof(b), "Step: %s", item->step);
+    else if (item && item->age_min >= 0) {
+        if (item->age_min < 60) snprintf(b, sizeof(b), "%dm ago", item->age_min);
+        else snprintf(b, sizeof(b), "%dh ago", item->age_min / 60);
+    } else snprintf(b, sizeof(b), "%s", !strcmp(state, "unknown") ? "Check login / access" : "");
+    lv_label_set_text(lbl_ci_step, b);
+    const char* branch = item ? item->branch : data.branch;
+    snprintf(b, sizeof(b), "%s%s%s", branch[0] ? branch : "", item && item->sha[0] ? " / " : "", item ? item->sha : "");
+    lv_label_set_text(lbl_ci_branch, b);
+    b[0] = '\0';
+    if (item && item->failed > 0) {
+        snprintf(b, sizeof(b), "%d failed | ", item->failed);
+    }
+    size_t used = strlen(b);
+    if (item && item->age_min >= 0) {
+        snprintf(b + used, sizeof(b) - used, "%dm ago | ", item->age_min);
+        used = strlen(b);
+    }
+    if (data.review_ok) snprintf(b + used, sizeof(b) - used, "%d review | %d need work", data.review, data.changes);
+    else snprintf(b + used, sizeof(b) - used, "Review unavailable");
+    used = strlen(b);
+    if (data.conflict) snprintf(b + used, sizeof(b) - used, " | CONFLICT");
+    else if (data.dirty > 0 || data.ahead > 0 || data.behind > 0)
+        snprintf(b + used, sizeof(b) - used, " | local %d chg +%d -%d", data.dirty > 0 ? data.dirty : 0, data.ahead, data.behind);
+    lv_label_set_text(lbl_ci_footer, b);
 }
 
 // ======== Today Screen (daily summary) ========
@@ -1270,6 +1377,7 @@ static void init_sensor_screen(lv_obj_t* scr) {
 #define COL_TR_TEMP   lv_color_hex(0xd97757)   // brand terra-cotta
 #define COL_TR_HUM    lv_color_hex(0x6a9ec0)   // muted blue
 #define COL_TR_PRESS  lv_color_hex(0xa89bc4)   // muted violet
+#define COL_TR_AQ     lv_color_hex(0x7fb5a5)   // muted teal
 
 // Smallest y-axis span we'll scale to, per metric. Without a floor, a room
 // that held dead steady all day renders sensor noise as a mountain range.
@@ -1277,6 +1385,7 @@ static const float TREND_MIN_SPAN[SH_METRIC_COUNT] = {
     2.0f,   // degC
     5.0f,   // %RH
     4.0f,   // hPa
+    0.10f,  // Rs/R0 (air quality)
 };
 
 #define TREND_PAD     5     // card inset
@@ -1305,6 +1414,7 @@ static void fmt_metric(sh_metric_t m, float v, char* b, size_t n, bool with_unit
     switch (m) {
     case SH_TEMP:  snprintf(b, n, with_unit ? "%.1f C"   : "%.1f", (double)v); break;
     case SH_HUM:   snprintf(b, n, with_unit ? "%.0f%%"   : "%.0f", (double)v); break;
+    case SH_AQ:    snprintf(b, n, "%.2f", (double)v); break;
     default:       snprintf(b, n, with_unit ? "%.0f hPa" : "%.0f", (double)v); break;
     }
 }
@@ -1502,8 +1612,10 @@ static void refresh_trend_screen(void) {
     // axis than they belong. Say so rather than implying exact timing.
     lv_label_set_text(lbl_trend_from, sensor_hist_time_is_real() ? "-24h" : "~24h");
 
-    const float live[SH_METRIC_COUNT] = { g_env_t, g_env_h, g_env_p };
-    for (int m = 0; m < SH_METRIC_COUNT; m++) {
+    // Env metrics only -- SH_AQ has its own page (the Air screen), and
+    // trend[SH_AQ] is never built.
+    const float live[SH_METRIC_COUNT] = { g_env_t, g_env_h, g_env_p, NAN };
+    for (int m = SH_TEMP; m <= SH_PRESS; m++) {
         if (m == SH_HUM && !sensor_shows_humidity) continue;
         trend_rebuild(&trend[m]);
         char b[16];
@@ -1549,11 +1661,135 @@ static void refresh_sensor_spark(void) {
     lv_label_set_text(spark.lbl_val, b);
 }
 
+// ======== Air Screen (MQ-135, on-device ADC -- gas_sensor.cpp) ========
+//
+// Level word up top (what you actually want to know at a glance), Rs/R0 under
+// it with a bar (1.0 = clean, 0.4 = full), a status line (warm-up / source
+// hint / raw voltage, plus baseline mode), and the 24 h ratio trace. The ratio
+// leads because it's the one thing the sensor measures; per-gas equivalents
+// live on the Gases page.
+
+#define AIR_BAR_FULL  0.4f   // ratio at which the bar is full
+#define AIR_SPARK_Y   140
+
+static lv_obj_t* air_container;
+static lv_obj_t* lbl_air_level;
+static lv_obj_t* lbl_air_ratio;
+static lv_obj_t* bar_air;
+static lv_obj_t* lbl_air_status;
+static lv_obj_t* lbl_air_base;
+static trend_plot_t air_spark;
+// Sticky: set by the first reading with something on the pin, never cleared.
+// A sensor that drops out later keeps its screen (showing "No sensor") rather
+// than vanishing from the cycle mid-session.
+static bool air_has_data = false;
+
+static void init_air_screen(lv_obj_t* scr) {
+    air_container = make_screen_container(scr, "Air");
+
+    lbl_air_level = lv_label_create(air_container);
+    lv_label_set_text(lbl_air_level, "--");
+    lv_obj_set_style_text_font(lbl_air_level, &font_styrene_24, 0);
+    lv_obj_set_style_text_color(lbl_air_level, COL_TEXT, 0);
+    lv_obj_set_pos(lbl_air_level, MARGIN + 2, CONTENT_Y - 4);
+
+    lbl_air_ratio = lv_label_create(air_container);
+    lv_label_set_text(lbl_air_ratio, "--");
+    lv_obj_set_style_text_font(lbl_air_ratio, &font_styrene_16, 0);
+    lv_obj_set_style_text_color(lbl_air_ratio, COL_TEXT, 0);
+    lv_obj_set_pos(lbl_air_ratio, MARGIN + 2, CONTENT_Y + 30);
+
+    lv_obj_t* unit = lv_label_create(air_container);
+    lv_label_set_text(unit, "Rs/R0");
+    lv_obj_set_style_text_font(unit, &font_styrene_12, 0);
+    lv_obj_set_style_text_color(unit, COL_DIM, 0);
+    lv_obj_align(unit, LV_ALIGN_TOP_RIGHT, -MARGIN - 2, CONTENT_Y + 33);
+
+    bar_air = make_bar(air_container, MARGIN, CONTENT_Y + 54, CONTENT_W, 8);
+
+    lbl_air_status = lv_label_create(air_container);
+    lv_label_set_text(lbl_air_status, "");
+    lv_obj_set_style_text_font(lbl_air_status, &font_styrene_12, 0);
+    lv_obj_set_style_text_color(lbl_air_status, COL_DIM, 0);
+    lv_obj_set_pos(lbl_air_status, MARGIN + 2, CONTENT_Y + 68);
+
+    lbl_air_base = lv_label_create(air_container);
+    lv_label_set_text(lbl_air_base, "");
+    lv_obj_set_style_text_font(lbl_air_base, &font_styrene_12, 0);
+    lv_obj_set_style_text_color(lbl_air_base, COL_DIM, 0);
+    lv_obj_align(lbl_air_base, LV_ALIGN_TOP_RIGHT, -MARGIN - 2, CONTENT_Y + 68);
+
+    make_trend_panel(air_container, AIR_SPARK_Y, SPARK_BOTTOM - AIR_SPARK_Y,
+                     "Trend", SH_AQ, COL_TR_AQ, &air_spark);
+
+    lv_obj_add_flag(air_container, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void refresh_air_spark(void) {
+    trend_rebuild(&air_spark);
+    lv_label_set_text(air_spark.lbl_val, sensor_hist_time_is_real() ? "24h" : "~24h");
+}
+
+static lv_color_t air_level_color(AirLevel l) {
+    switch (l) {
+    case AIR_GOOD: return COL_GREEN;
+    case AIR_FAIR: return COL_AMBER;
+    default:       return COL_RED;
+    }
+}
+
+// ======== Gases Screen (per-gas equivalents of the one MQ-135 reading) ========
+//
+// Built together with the Air screen. Each row is the datasheet curve for that
+// gas applied to the same Rs/R0, so the rows always move together -- the
+// footer says so, so nobody reads them as six separate measurements.
+
+static lv_obj_t* gases_container;
+static lv_obj_t* lbl_gas_v[AIR_GAS_COUNT];
+
+static void init_gases_screen(lv_obj_t* scr) {
+    gases_container = make_screen_container(scr, "Gases");
+    for (int i = 0; i < AIR_GAS_COUNT; i++)
+        lbl_gas_v[i] = make_today_row(gases_container, CONTENT_Y + 2 + i * 26, GAS_DEFS[i].name);
+
+    lv_obj_t* foot = lv_label_create(gases_container);
+    lv_label_set_text(foot, "ppm equiv. - 1 sensor");
+    lv_obj_set_style_text_font(foot, &font_styrene_12, 0);
+    lv_obj_set_style_text_color(foot, COL_DIM, 0);
+    lv_obj_set_pos(foot, MARGIN + 2, 214);
+
+    lv_obj_add_flag(gases_container, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void refresh_gases(const AirData* a) {
+    for (int i = 0; i < AIR_GAS_COUNT; i++) {
+        const GasDef& g = GAS_DEFS[i];
+        float excess = a->gas_ppm[i] - g.base;
+        char b[16];
+        lv_color_t col = COL_TEXT;
+        if (!a->present || a->warming) {
+            snprintf(b, sizeof(b), "--");
+            col = COL_DIM;
+        } else {
+            // Outside the datasheet's plotted range the curve is extrapolation:
+            // say "<" / ">" rather than print a confident number.
+            if (excess > g.hi)                  snprintf(b, sizeof(b), ">%.0f", (double)(g.base + g.hi));
+            else if (g.base > 0 || excess >= g.lo) snprintf(b, sizeof(b), "%.0f", (double)a->gas_ppm[i]);
+            else                                snprintf(b, sizeof(b), "<%.0f", (double)g.lo);
+            if (a->gas_level[i] == AIR_FAIR)      col = COL_AMBER;
+            else if (a->gas_level[i] != AIR_GOOD) col = COL_RED;
+        }
+        lv_label_set_text(lbl_gas_v[i], b);
+        lv_obj_set_style_text_color(lbl_gas_v[i], col, 0);
+    }
+}
+
 // Redraw whichever trend view is on screen. Cheap enough to call on every
 // reading change, but rate-limited by ui_tick_anim() anyway.
 static void refresh_trends_if_visible(void) {
     if (current_screen == SCREEN_SENSOR)            refresh_sensor_spark();
     else if (current_screen == SCREEN_SENSOR_GRAPH) refresh_trend_screen();
+    else if (current_screen == SCREEN_AIR)          refresh_air_spark();
 }
 
 // ======== Public API ========
@@ -1563,7 +1799,7 @@ static void refresh_trends_if_visible(void) {
 // short row of dots gives a sense of "how many presses to get back here"
 // without a persistent on-screen element. Shown for DOTS_VISIBLE_MS after
 // every ui_show_screen(), then hidden by ui_tick_anim().
-#define MAX_DOTS 11
+#define MAX_DOTS 14   // >= CYCLE_COUNT, or the last stops never light up (14 x 8 px fits)
 static lv_obj_t* dot_objs[MAX_DOTS] = { nullptr };
 static uint32_t  dots_hide_ms = 0;   // 0 = not pending
 #define DOTS_VISIBLE_MS  1500
@@ -1573,17 +1809,21 @@ static uint32_t  dots_hide_ms = 0;   // 0 = not pending
 static const screen_t CYCLE_ORDER[] = {
     SCREEN_CLOCK, SCREEN_AURORA, SCREEN_SENSOR, SCREEN_SENSOR_GRAPH, SCREEN_USAGE,
     SCREEN_COPILOT, SCREEN_SYSINFO, SCREEN_VSCODE, SCREEN_BLUETOOTH,
-    SCREEN_CI, SCREEN_TODAY,
+    SCREEN_CI, SCREEN_TODAY, SCREEN_CODEX, SCREEN_AIR, SCREEN_GASES,
 };
 #define CYCLE_COUNT (sizeof(CYCLE_ORDER) / sizeof(CYCLE_ORDER[0]))
+static_assert(MAX_DOTS >= CYCLE_COUNT, "raise MAX_DOTS with CYCLE_ORDER");
 
 static bool screen_is_populated(screen_t s) {
     switch (s) {
     case SCREEN_SYSINFO:      return sysinfo_has_data;
     case SCREEN_VSCODE:       return vscode_has_data;
     case SCREEN_CI:           return ci_has_data;
+    case SCREEN_CODEX:        return codex_has_data;
     case SCREEN_TODAY:        return today_has_data;
     case SCREEN_AURORA:       return aurora_has_data;
+    case SCREEN_AIR:
+    case SCREEN_GASES:        return air_has_data;
     case SCREEN_SENSOR:
     case SCREEN_SENSOR_GRAPH: return sensor_has_data;
     default:                  return true;
@@ -2093,79 +2333,22 @@ void ui_update_ci(const CiData* data) {
     note_data();
     if (!ci_has_data) init_ci_screen(lv_screen_active());
     ci_has_data = true;
+    ci_data = data;
+    ci_page = 0;
+    ci_page_ms = lv_tick_get();
+    render_ci_page();
 
-    lv_color_t dc; const char* st;
     bool failing = strcmp(data->state, "fail") == 0;
-    if      (strcmp(data->state, "pass") == 0)    { dc = COL_GREEN; st = "Passing"; }
-    else if (failing)                             { dc = COL_RED;   st = "Failing"; }
-    else if (strcmp(data->state, "running") == 0) { dc = COL_AMBER; st = "Running"; }
-    else                                          { dc = COL_DIM;   st = "No runs"; }
-    lv_obj_set_style_bg_color(ci_dot, dc, 0);
-    lv_label_set_text(lbl_ci_state, st);
-
-    // Surface a fresh CI failure even if the Checks screen isn't the one on
-    // screen right now; clears itself once CI recovers.
+    for (int i = 0; i < data->item_count; ++i)
+        failing |= strcmp(data->items[i].state, "fail") == 0;
     static bool ci_alert_armed = false;
     if (failing && !ci_alert_armed) {
         ci_alert_armed = true;
-        banner_show(BANNER_ALERT, "CI is failing", COL_RED, COL_TEXT, 0);
+        if (current_screen != SCREEN_CI)
+            banner_show(BANNER_ALERT, "CI is failing", COL_RED, COL_TEXT, 0);
     } else if (!failing && ci_alert_armed) {
         ci_alert_armed = false;
         banner_clear(BANNER_ALERT);
-    }
-
-    char b[48];
-    if (data->wf[0] && data->age_min >= 0) {
-        if (data->age_min < 60) snprintf(b, sizeof(b), "%.14s - %dm ago", data->wf, data->age_min);
-        else                    snprintf(b, sizeof(b), "%.14s - %dh ago", data->wf, data->age_min / 60);
-    } else if (data->wf[0]) {
-        snprintf(b, sizeof(b), "%.16s", data->wf);
-    } else {
-        b[0] = '\0';
-    }
-    lv_label_set_text(lbl_ci_wf, b);
-
-    if (data->review > 0 && data->changes > 0)
-        snprintf(b, sizeof(b), "%d review  %d chg", data->review, data->changes);
-    else if (data->review > 0)
-        snprintf(b, sizeof(b), "%d to review", data->review);
-    else if (data->changes > 0)
-        snprintf(b, sizeof(b), "%d need work", data->changes);
-    else
-        snprintf(b, sizeof(b), "queue clear");
-    lv_label_set_text(lbl_ci_pr, b);
-    lv_obj_set_style_text_color(lbl_ci_pr, data->changes > 0 ? COL_AMBER : COL_TEXT, 0);
-
-    // Git working tree: marker + branch name, then dirty/ahead/behind chips.
-    // A conflict recolors the marker instead of adding a fourth chip — rare
-    // enough not to need its own slot.
-    snprintf(b, sizeof(b), "%.20s", data->branch[0] ? data->branch : "-");
-    lv_label_set_text(lbl_ci_branch, b);
-    lv_obj_set_style_bg_color(dot_ci_branch, data->conflict ? COL_RED : COL_DIM, 0);
-
-    if (data->dirty > 0) {
-        lv_label_set_text_fmt(pill_ci_dirty, "%d chg", data->dirty);
-        lv_obj_set_style_bg_color(pill_ci_dirty, COL_AMBER, 0);
-        lv_obj_set_style_text_color(pill_ci_dirty, COL_BG, 0);
-        lv_obj_clear_flag(pill_ci_dirty, LV_OBJ_FLAG_HIDDEN);
-    } else {
-        lv_obj_add_flag(pill_ci_dirty, LV_OBJ_FLAG_HIDDEN);
-    }
-    if (data->ahead > 0) {
-        lv_label_set_text_fmt(pill_ci_ahead, "+%d", data->ahead);
-        lv_obj_set_style_bg_color(pill_ci_ahead, COL_GREEN, 0);
-        lv_obj_set_style_text_color(pill_ci_ahead, COL_BG, 0);
-        lv_obj_clear_flag(pill_ci_ahead, LV_OBJ_FLAG_HIDDEN);
-    } else {
-        lv_obj_add_flag(pill_ci_ahead, LV_OBJ_FLAG_HIDDEN);
-    }
-    if (data->behind > 0) {
-        lv_label_set_text_fmt(pill_ci_behind, "-%d", data->behind);
-        lv_obj_set_style_bg_color(pill_ci_behind, COL_BAR_BG, 0);
-        lv_obj_set_style_text_color(pill_ci_behind, COL_DIM, 0);
-        lv_obj_clear_flag(pill_ci_behind, LV_OBJ_FLAG_HIDDEN);
-    } else {
-        lv_obj_add_flag(pill_ci_behind, LV_OBJ_FLAG_HIDDEN);
     }
 }
 
@@ -2212,6 +2395,60 @@ const char* ui_get_act_state_str(void) {
 int ui_get_act_agents(void) { return g_act_agents; }
 
 const char* ui_get_daemon_state(void) { return daemon_state; }
+
+// MQ-135 reading, pushed locally by main.cpp (on-device, like the env sensor
+// below -- no note_data()). Air + Gases are built lazily on the first reading
+// with something actually on the pin (CLAUDE.md gotcha #14).
+void ui_update_air(const AirData* a) {
+    if (!air_has_data) {
+        if (!a->present) return;   // nothing wired: never build the screens
+        init_air_screen(lv_screen_active());
+        init_gases_screen(lv_screen_active());
+        air_has_data = true;
+    }
+    refresh_gases(a);
+
+    char b[32];
+    if (!a->present) {
+        lv_label_set_text(lbl_air_level, "No sensor");
+        lv_obj_set_style_text_color(lbl_air_level, COL_DIM, 0);
+        lv_label_set_text(lbl_air_ratio, "--");
+        lv_bar_set_value(bar_air, 0, LV_ANIM_OFF);
+        lv_label_set_text(lbl_air_status, "check wiring");
+        lv_label_set_text(lbl_air_base, "");
+        return;
+    }
+
+    static const char* const NAMES[] = { "Good", "Fair", "Poor", "Bad" };
+    lv_color_t col = air_level_color(a->level);
+    if (a->warming) {
+        lv_label_set_text(lbl_air_level, "Warming");
+        lv_obj_set_style_text_color(lbl_air_level, COL_DIM, 0);
+        snprintf(b, sizeof(b), "heater %d:%02d", a->warm_left_s / 60, a->warm_left_s % 60);
+    } else {
+        lv_label_set_text(lbl_air_level, NAMES[a->level]);   // saturated => AIR_BAD
+        lv_obj_set_style_text_color(lbl_air_level, col, 0);
+        if (a->hint == AIR_HINT_SPIKE)     snprintf(b, sizeof(b), "spike: VOC/alc?");
+        else if (a->hint == AIR_HINT_SLOW) snprintf(b, sizeof(b), "stale: air out?");
+        else snprintf(b, sizeof(b), "%d.%02dV", a->mv / 1000, (a->mv % 1000) / 10);
+    }
+    lv_label_set_text(lbl_air_status, b);
+    lv_obj_set_style_text_color(lbl_air_status,
+                                a->hint != AIR_HINT_NONE ? COL_AMBER : COL_DIM, 0);
+
+    // A cold heater reads as heavily polluted air -- no number until it settles.
+    if (a->warming) snprintf(b, sizeof(b), "--");
+    else            snprintf(b, sizeof(b), "%.2f", (double)a->ratio);
+    lv_label_set_text(lbl_air_ratio, b);
+
+    float fill = (1.0f - a->ratio) / (1.0f - AIR_BAR_FULL);
+    if (fill < 0) fill = 0;
+    if (fill > 1) fill = 1;
+    lv_bar_set_value(bar_air, (int)lroundf(fill * 100), LV_ANIM_OFF);
+    lv_obj_set_style_bg_color(bar_air, a->warming ? COL_DIM : col, LV_PART_INDICATOR);
+
+    lv_label_set_text(lbl_air_base, a->calibrated ? "cal" : "auto");
+}
 
 // Env sensor reading (BME280 or BMP180, whichever env_sensor.cpp found),
 // pushed locally by main.cpp — not a daemon payload, so no note_data() here;
@@ -2405,12 +2642,21 @@ void ui_tick_anim(void) {
         refresh_status_label();
         timer_tick();  // runs on any screen so the break banner still fires
         if (current_screen == SCREEN_CLOCK) refresh_clock(false);
+        if (current_screen == SCREEN_CODEX) refresh_codex();
+    }
+
+    if (current_screen == SCREEN_CI && ci_data && ci_data->item_count > 1 &&
+        now - ci_page_ms >= 8000) {
+        ci_page = (ci_page + 1) % ci_data->item_count;
+        ci_page_ms = now;
+        render_ci_page();
     }
 
     // Trend graphs advance on a 15-minute cadence, so a slow refresh is
     // plenty — it keeps the right-hand edge tracking the live reading
     // without rebuilding polylines on every sensor poll.
-    if (current_screen == SCREEN_SENSOR || current_screen == SCREEN_SENSOR_GRAPH) {
+    if (current_screen == SCREEN_SENSOR || current_screen == SCREEN_SENSOR_GRAPH ||
+        current_screen == SCREEN_AIR) {
         static uint32_t trend_last_ms = 0;
         if (now - trend_last_ms >= 15000) {
             trend_last_ms = now;
@@ -2510,9 +2756,12 @@ void ui_show_screen(screen_t screen) {
     if (sysinfo_container)  lv_obj_add_flag(sysinfo_container, LV_OBJ_FLAG_HIDDEN);
     if (vscode_container)   lv_obj_add_flag(vscode_container, LV_OBJ_FLAG_HIDDEN);
     if (ci_container)       lv_obj_add_flag(ci_container, LV_OBJ_FLAG_HIDDEN);
+    if (codex_container)    lv_obj_add_flag(codex_container, LV_OBJ_FLAG_HIDDEN);
     if (today_container)    lv_obj_add_flag(today_container, LV_OBJ_FLAG_HIDDEN);
     if (sensor_container)   lv_obj_add_flag(sensor_container, LV_OBJ_FLAG_HIDDEN);
     if (trend_container)    lv_obj_add_flag(trend_container, LV_OBJ_FLAG_HIDDEN);
+    if (air_container)      lv_obj_add_flag(air_container, LV_OBJ_FLAG_HIDDEN);
+    if (gases_container)    lv_obj_add_flag(gases_container, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(conn_container, LV_OBJ_FLAG_HIDDEN);
     splash_hide();
 
@@ -2534,8 +2783,19 @@ void ui_show_screen(screen_t screen) {
         break;
     case SCREEN_SYSINFO:    lv_obj_clear_flag(sysinfo_container, LV_OBJ_FLAG_HIDDEN); break;
     case SCREEN_VSCODE:     lv_obj_clear_flag(vscode_container, LV_OBJ_FLAG_HIDDEN); break;
-    case SCREEN_CI:         lv_obj_clear_flag(ci_container, LV_OBJ_FLAG_HIDDEN); break;
+    case SCREEN_CI:
+        if (lbl_banner && strcmp(lv_label_get_text(lbl_banner), "CI is failing") == 0)
+            banner_clear(BANNER_ALERT);
+        ci_page = 0;
+        ci_page_ms = lv_tick_get();
+        render_ci_page();
+        lv_obj_clear_flag(ci_container, LV_OBJ_FLAG_HIDDEN);
+        break;
     case SCREEN_TODAY:      lv_obj_clear_flag(today_container, LV_OBJ_FLAG_HIDDEN); break;
+    case SCREEN_CODEX:
+        refresh_codex();
+        lv_obj_clear_flag(codex_container, LV_OBJ_FLAG_HIDDEN);
+        break;
     case SCREEN_SENSOR:
         lv_obj_clear_flag(sensor_container, LV_OBJ_FLAG_HIDDEN);
         refresh_sensor_spark();
@@ -2544,6 +2804,11 @@ void ui_show_screen(screen_t screen) {
         lv_obj_clear_flag(trend_container, LV_OBJ_FLAG_HIDDEN);
         refresh_trend_screen();
         break;
+    case SCREEN_AIR:
+        lv_obj_clear_flag(air_container, LV_OBJ_FLAG_HIDDEN);
+        refresh_air_spark();
+        break;
+    case SCREEN_GASES:      lv_obj_clear_flag(gases_container, LV_OBJ_FLAG_HIDDEN); break;
     case SCREEN_BLUETOOTH:  lv_obj_clear_flag(conn_container, LV_OBJ_FLAG_HIDDEN); break;
     default: break;
     }
@@ -2577,7 +2842,8 @@ void ui_cycle_screen(void) {
         else if (next == SCREEN_VSCODE)    next = SCREEN_BLUETOOTH;
         else if (next == SCREEN_BLUETOOTH) next = SCREEN_CI;
         else if (next == SCREEN_CI)        next = SCREEN_TODAY;
-        else if (next == SCREEN_TODAY)     next = SCREEN_SPLASH;
+        else if (next == SCREEN_TODAY)     next = SCREEN_CODEX;
+        else if (next == SCREEN_CODEX)     next = SCREEN_SPLASH;
         else                              next = SCREEN_CLOCK;  // from SPLASH (or first run)
         // Skip screens that have never received data from the daemon, or
         // that the user has hidden, so cycling only surfaces real content

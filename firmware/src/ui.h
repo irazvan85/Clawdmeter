@@ -15,18 +15,23 @@ enum screen_t {
     SCREEN_CI,
     SCREEN_TODAY,
     SCREEN_AURORA,
+    SCREEN_CODEX,
+    SCREEN_AIR,            // MQ-135 air quality, on-device ADC
+    SCREEN_GASES,          // MQ-135 per-gas equivalents (same reading)
     SCREEN_COUNT,
 };
 
 void ui_init(void);
 void ui_update(const UsageData* data);
 void ui_update_copilot(const CopilotData* data);
+void ui_update_codex(const CodexData* data);
 void ui_update_sysinfo(const SysInfoData* data);
 void ui_update_vscode(const VscodeData* data);
 void ui_update_env(const EnvData* data);         // {"src":"env",...} — clock + weather
 void ui_update_aurora(const AuroraData* data);   // {"src":"aurora",...} — aurora borealis forecast
 void ui_update_sensor(bool present, float temp_c, float pressure_hpa,
                        bool has_humidity, float humidity_pct); // env sensor (BME280/BMP180), on-device
+void ui_update_air(const AirData* data);        // MQ-135 air quality, on-device
 void ui_update_ci(const CiData* data);           // {"src":"ci",...}  — CI + review queue
 void ui_update_today(const TodayData* data);      // {"src":"sum",...}
 void ui_update_act(const char* state, int agents); // {"src":"act",...} — Claude activity
@@ -41,6 +46,7 @@ bool ui_banner_visible(void);                    // main.cpp: a press dismisses 
 void ui_hide_banner(void);
 bool ui_claude_working(void);                     // main.cpp: backlight breathe
 void ui_timer_toggle(void);                        // Clock screen long-press: focus timer
+void ui_show_notice(const char* text, bool ok);    // transient banner (3 s), e.g. "Baseline set"
 void ui_tick_anim(void);
 void ui_show_screen(screen_t screen);
 void ui_cycle_screen(void);

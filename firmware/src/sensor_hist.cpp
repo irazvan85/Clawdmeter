@@ -7,15 +7,16 @@
 namespace {
 
 #define SH_SLOT_MS   ((uint32_t)SH_SLOT_SECS * 1000UL)
-#define SH_MAGIC     0x53483031UL   // "SH01"
+#define SH_MAGIC     0x53483033UL   // "SH03" — SH01 had no air field, SH02 stored it as ppm
 #define SH_NONE      INT16_MIN      // per-field "no reading" sentinel
 #define SH_P_BASE    800.0f         // pressure is stored as (hPa - 800) x10
 
-// 6 bytes/slot; 96 slots -> 576 bytes of samples.
+// 8 bytes/slot; 96 slots -> 768 bytes of samples.
 struct Slot {
     int16_t t_dc;      // temp     x10 degC
     int16_t h_dpct;    // humidity x10 %
     int16_t p_dhpa;    // pressure x10 hPa, offset by SH_P_BASE
+    int16_t aq_ratio;  // MQ-135 Rs/R0 x1000
 };
 
 struct Blob {
@@ -31,10 +32,10 @@ struct Blob {
 // older device's stored ring will be misread after an update. The magic and
 // the length check in sensor_hist_init() catch a genuine format change; these
 // catch an accidental one.
-static_assert(sizeof(Slot) == 6,   "Slot layout changed - bump SH_MAGIC");
-static_assert(sizeof(Blob) == 588, "Blob layout changed - bump SH_MAGIC");
+static_assert(sizeof(Slot) == 8,   "Slot layout changed - bump SH_MAGIC");
+static_assert(sizeof(Blob) == 780, "Blob layout changed - bump SH_MAGIC");
 
-Blob g;                    // 588 bytes — the ring itself
+Blob g;                    // 780 bytes — the ring itself
 
 // Clock anchor. Buckets advance as millis() runs; sensor_hist_set_time()
 // re-pins the anchor to the daemon's wall clock whenever a payload arrives.
@@ -47,7 +48,7 @@ bool     saved_real    = false;   // the restored ring was wall-clock indexed
 float    acc[SH_METRIC_COUNT];
 uint16_t acc_n[SH_METRIC_COUNT];
 
-const Slot EMPTY_SLOT = { SH_NONE, SH_NONE, SH_NONE };
+const Slot EMPTY_SLOT = { SH_NONE, SH_NONE, SH_NONE, SH_NONE };
 
 void reset_acc(void) {
     for (int i = 0; i < SH_METRIC_COUNT; i++) { acc[i] = 0; acc_n[i] = 0; }
@@ -86,20 +87,25 @@ void roll_to(int32_t bucket) {
 }
 
 int16_t enc(sh_metric_t m, float v) {
-    float scaled = (m == SH_PRESS) ? (v - SH_P_BASE) * 10.0f : v * 10.0f;
+    float scaled = (m == SH_PRESS) ? (v - SH_P_BASE) * 10.0f
+                 : (m == SH_AQ)    ? v * 1000.0f
+                 :                   v * 10.0f;
     if (!(scaled > -32000.0f && scaled < 32000.0f)) return SH_NONE;  // also traps NaN
     return (int16_t)lroundf(scaled);
 }
 
 float dec(sh_metric_t m, int16_t raw) {
     if (raw == SH_NONE) return NAN;
-    return (m == SH_PRESS) ? raw / 10.0f + SH_P_BASE : raw / 10.0f;
+    if (m == SH_PRESS) return raw / 10.0f + SH_P_BASE;
+    if (m == SH_AQ)    return raw / 1000.0f;
+    return raw / 10.0f;
 }
 
 int16_t* field(Slot* s, sh_metric_t m) {
     switch (m) {
     case SH_TEMP:  return &s->t_dc;
     case SH_HUM:   return &s->h_dpct;
+    case SH_AQ:    return &s->aq_ratio;
     default:       return &s->p_dhpa;
     }
 }
@@ -203,6 +209,14 @@ void sensor_hist_sample(float temp_c, bool has_hum, float hum_pct, float press_h
     }
 }
 
+void sensor_hist_sample_aq(float ratio) {
+    if (isnan(ratio)) return;
+    int k = (int)SH_AQ;
+    acc[k] += ratio;
+    acc_n[k]++;
+    g.slot[g.head].aq_ratio = enc(SH_AQ, acc[k] / acc_n[k]);
+}
+
 int sensor_hist_series(sh_metric_t m, float* out, int n) {
     int valid = 0;
     for (int i = 0; i < SH_SLOTS; i++) {
@@ -219,7 +233,8 @@ int sensor_hist_span_mins(void) {
     for (int i = 0; i < SH_SLOTS; i++) {
         int idx = (g.head + 1 + i) % SH_SLOTS;
         const Slot* s = &g.slot[idx];
-        if (s->t_dc != SH_NONE || s->h_dpct != SH_NONE || s->p_dhpa != SH_NONE)
+        if (s->t_dc != SH_NONE || s->h_dpct != SH_NONE || s->p_dhpa != SH_NONE ||
+            s->aq_ratio != SH_NONE)
             return (SH_SLOTS - i) * (SH_SLOT_SECS / 60);
     }
     return 0;
@@ -242,6 +257,8 @@ void sensor_hist_debug_fill(void) {
         s->t_dc   = enc(SH_TEMP,  21.5f + 2.8f * diurnal + 0.15f * sinf(hours * 3.1f));
         s->h_dpct = enc(SH_HUM,   46.0f - 9.0f * diurnal + 0.8f  * sinf(hours * 2.3f));
         s->p_dhpa = enc(SH_PRESS, 1012.0f + 3.5f * sinf(hours / 19.0f * 2.0f * (float)M_PI));
+        // Rs/R0: dips through an occupied evening, recovers overnight.
+        s->aq_ratio = enc(SH_AQ, 0.95f - 0.22f * fmaxf(0.0f, -diurnal) + 0.02f * sinf(hours * 1.7f));
     }
     g.head = SH_SLOTS - 1;
     reset_acc();
