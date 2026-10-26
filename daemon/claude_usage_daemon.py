@@ -40,6 +40,7 @@ from pathlib import Path
 
 import httpx
 from codex_usage import CodexUsage, age_payload as age_codex_payload
+from cloud_push import CloudPush
 
 # Windows: prevent gh/git subprocess calls from flashing a console window
 # when the daemon itself runs without one (e.g. under the Scheduled Task).
@@ -1615,6 +1616,15 @@ class Session:
             log(f"Probe failed: {e}")
             return False
 
+    async def read_state(self) -> dict | None:
+        """GET /api/state -- open read, no token needed. Feeds the cloud push."""
+        try:
+            resp = await self.http.get(f"{self.base_url}/api/state")
+            return resp.json() if resp.status_code == 200 else None
+        except (httpx.HTTPError, ValueError) as e:
+            log(f"State read failed: {e}")
+            return None
+
     async def write_payload(self, payload: dict) -> bool:
         async with self.write_lock:
             return await self._write_payload(payload)
@@ -1683,12 +1693,17 @@ async def run_session(ip: str, stop_event: asyncio.Event) -> bool:
         await session.replay_last_payloads()
 
         codex = CodexUsage(cfg.get("codex_path", ""), cfg.get("codex_bucket", "codex"))
-        codex_task = asyncio.create_task(codex.run(session.write_payload, stop_event))
+        tasks = [asyncio.create_task(codex.run(session.write_payload, stop_event))]
+        # Optional remote dashboard (cloud/): off unless cloud_url is configured.
+        cloud = CloudPush.from_config(cfg, log)
+        if cloud is not None:
+            tasks.append(asyncio.create_task(cloud.run(session.read_state, stop_event)))
         try:
             return await _poll_loop(session, stop_event)
         finally:
-            codex_task.cancel()
-            await asyncio.gather(codex_task, return_exceptions=True)
+            for t in tasks:
+                t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
     finally:
         await session.aclose()
 

@@ -304,6 +304,25 @@ void build_state_json(JsonDocument& doc) {
             g["level"] = LEVELS[a.gas_level[i]];
         }
     }
+    {
+        // On-device env sensor (BME280/BMP180). Nulls rather than zeros for
+        // what the active chip can't measure, so a reader can't mistake a
+        // BMP180's missing humidity for 0 %.
+        JsonObject in = doc["indoor"].to<JsonObject>();
+        bool present = env_sensor_is_present();
+        in["present"] = present;
+        if (present) {
+            in["temp_c"]       = roundf(env_sensor_temp_c() * 10) / 10;
+            in["pressure_hpa"] = roundf(env_sensor_pressure_hpa() * 10) / 10;
+        } else {
+            in["temp_c"]       = nullptr;
+            in["pressure_hpa"] = nullptr;
+        }
+        if (present && env_sensor_has_humidity())
+            in["humidity_pct"] = roundf(env_sensor_humidity_pct() * 10) / 10;
+        else
+            in["humidity_pct"] = nullptr;
+    }
     JsonObject cx = doc["codex"].to<JsonObject>();
     cx["p1"] = codex.pct[0];
     cx["p2"] = codex.pct[1];
