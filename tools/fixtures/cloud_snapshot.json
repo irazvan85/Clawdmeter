@@ -1,0 +1,147 @@
+{
+  "v": 1,
+  "sent_at": 1793000000,
+  "air": {
+    "present": true,
+    "warming": false,
+    "calibrated": true,
+    "mv": 1291,
+    "ratio": 3.824,
+    "level": "good",
+    "saturated": false,
+    "hint": "spike",
+    "gases": {
+      "co2": {
+        "ppm": 400,
+        "level": "good"
+      },
+      "nh3": {
+        "ppm": 0,
+        "level": "good"
+      },
+      "alcohol": {
+        "ppm": 0,
+        "level": "good"
+      },
+      "toluene": {
+        "ppm": 0,
+        "level": "good"
+      },
+      "acetone": {
+        "ppm": 0,
+        "level": "good"
+      },
+      "co": {
+        "ppm": 0,
+        "level": "good"
+      }
+    }
+  },
+  "indoor": {
+    "present": true,
+    "temp_c": 22.4,
+    "pressure_hpa": 1013.2,
+    "humidity_pct": null
+  },
+  "claude": {
+    "session_pct": 21,
+    "session_reset_mins": 16,
+    "weekly_pct": 88,
+    "weekly_reset_mins": 2676,
+    "status": "allowed",
+    "model": "Opus",
+    "ctx_pct": 100,
+    "valid": true
+  },
+  "activity": {
+    "state": "working",
+    "agents": 1
+  },
+  "copilot": {
+    "premium_pct": 100,
+    "premium_total": 1500,
+    "premium_reset_str": "Nov 1",
+    "plan": "Pro",
+    "valid": true
+  },
+  "codex": {
+    "p1": 56,
+    "p2": 9,
+    "w1": 300,
+    "w2": 10080,
+    "r1": 1793012691,
+    "r2": 1793599491,
+    "ts": 1793010239,
+    "st": "ok",
+    "plan": "team",
+    "valid": true
+  },
+  "sysinfo": {
+    "cpu_pct": 33,
+    "ram_pct": 82,
+    "disk_pct": 91,
+    "cpu_temp": -1,
+    "valid": true
+  },
+  "today": {
+    "active_min": 8,
+    "tok_k": 1785,
+    "usd": 13,
+    "commits": 0,
+    "cp_used": -1,
+    "valid": true
+  },
+  "device": {
+    "uptime_s": 646,
+    "heap_free": 71304,
+    "heap_min_free": 47452,
+    "wifi_ok": true,
+    "daemon_state": ""
+  },
+  "weather": {
+    "temp_c": 11,
+    "hi_c": 14,
+    "lo_c": 7,
+    "wcode": 3,
+    "loc": "Testville",
+    "aurora_pct": 0,
+    "kp_x10": 13,
+    "cloud_pct": 100,
+    "night": false
+  },
+  "ci": {
+    "state": "unknown",
+    "review": 1,
+    "total": 2,
+    "items": [
+      {
+        "state": "fail",
+        "repo": "example/repo",
+        "title": "Fix the thing",
+        "branch": "main",
+        "workflow": "CI",
+        "job": "build",
+        "step": "compile",
+        "pr": 12,
+        "url": "https://github.com/example/repo/pull/12"
+      },
+      {
+        "state": "review",
+        "repo": "example/other",
+        "title": "Sneaky",
+        "branch": "",
+        "workflow": "",
+        "job": "",
+        "step": "",
+        "pr": 3,
+        "url": ""
+      }
+    ]
+  },
+  "vscode": {
+    "mem_mb": 6712,
+    "cpu_pct": 26,
+    "ext_count": 0,
+    "error_count": 1184
+  }
+}

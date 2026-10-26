@@ -111,6 +111,8 @@ web_server.{h,cpp} — HTTP dashboard/state/data-ingest server (port 80, stock
                    (build_state_json(), main.cpp) so the dashboard's nav
                    hint can show the device's actual current screen without
                    a round trip through the screenshot route.
+device_api.h    — (GET /api/state also carries `indoor` -- env sensor temp/pressure/
+                   humidity, null where the chip can't measure -- and `air`.)
 device_api.h    — build_state_json()/capture_screenshot_streamed()/
                    device_ingest_payload(), implemented in main.cpp (owns
                    the data), declared here so web_server.cpp can reach
@@ -250,6 +252,8 @@ Full per-session history (the reasoning behind gotchas #11–#15, BLE removal, P
 ## Daemon / host side
 
 `daemon/claude_usage_daemon.py` reads the Claude OAuth token, polls the Anthropic API (and Copilot/sysinfo/vscode/env/aurora/ci/today sources), and **POSTs** each JSON payload to the device's `POST /api/payload` (`firmware/src/web_server.cpp`) — BLE was removed from the firmware (CLAUDE.md gotcha #14), so WiFi/HTTP is the sole transport now. Windows: installed as a per-user Scheduled Task via `daemon/install-windows.ps1` (see that script's own `.SYNOPSIS` for why it's a Scheduled Task and not a true Service). Linux: `systemctl --user start claude-usage-daemon` via `daemon/claude-usage-daemon.service` — the unit file's `ExecStart` is the absolute path to the script, repoint it when switching between the worktree and the main checkout.
+
+`daemon/cloud_push.py` (optional, off unless `cloud_url` is set) feeds the remote dashboard in `cloud/` (Next.js on Vercel Hobby + Upstash Redis): once a minute it GETs the device's `/api/state`, keeps a field-level allowlist (never the token/IPs; weather/ci/vscode are opt-in via `cloud_sections`), HMAC-signs it with `cloud_secret` and POSTs to `/api/ingest`. Outbound-only and read-only -- the cloud has no path back to the device. The page is GitHub-OAuth-gated to one numeric GitHub id. `tools/fixtures/cloud_snapshot.json` is the shared contract: `tools/tests/test_cloud_push.py` pins the daemon's output to it and `cloud/test/schema.test.ts` validates it against the zod schema. Setup and security model: `cloud/README.md`.
 
 `daemon/codex_usage.py` runs a managed local Codex app-server and reads `account/rateLimits/read` every minute, also accepting quota notifications. It uses the existing Codex sign-in and sends only normalized quota data to the device. Its task is independent of other source polling; device writes are serialized. Cached readings retain their sample time and become stale after three minutes. Optional daemon config keys `codex_path` and `codex_bucket` override executable discovery and the default quota bucket.
 

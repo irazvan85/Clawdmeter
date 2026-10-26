@@ -1,0 +1,191 @@
+{
+  "air": {
+    "present": true,
+    "warming": false,
+    "calibrated": true,
+    "mv": 1291,
+    "ratio": 3.824,
+    "level": "good",
+    "saturated": false,
+    "hint": "spike",
+    "gases": {
+      "co2": {
+        "ppm": 400,
+        "level": "good"
+      },
+      "nh3": {
+        "ppm": 0,
+        "level": "good"
+      },
+      "alcohol": {
+        "ppm": 0,
+        "level": "good"
+      },
+      "toluene": {
+        "ppm": 0,
+        "level": "good"
+      },
+      "acetone": {
+        "ppm": 0,
+        "level": "good"
+      },
+      "co": {
+        "ppm": 0,
+        "level": "good"
+      }
+    }
+  },
+  "codex": {
+    "p1": 56,
+    "p2": 9,
+    "w1": 300,
+    "w2": 10080,
+    "r1": 1793012691,
+    "r2": 1793599491,
+    "ts": 1793010239,
+    "age": 0,
+    "st": "ok",
+    "plan": "team",
+    "bucket": "codex",
+    "valid": true
+  },
+  "claude": {
+    "session_pct": 21,
+    "session_reset_mins": 16,
+    "weekly_pct": 88,
+    "weekly_reset_mins": 2676,
+    "status": "allowed",
+    "model": "Opus",
+    "ctx_pct": 100,
+    "valid": true
+  },
+  "activity": {
+    "state": "working",
+    "agents": 1
+  },
+  "copilot": {
+    "premium_pct": 100,
+    "premium_remaining": -1,
+    "premium_total": 1500,
+    "premium_reset_str": "Nov 1",
+    "plan": "Pro",
+    "enabled": true,
+    "valid": true
+  },
+  "sysinfo": {
+    "cpu_pct": 33,
+    "cpu_temp": -1,
+    "ram_pct": 82,
+    "ram_used_gb": 21.2,
+    "ram_total_gb": 25.6,
+    "disk_pct": 91,
+    "disk_used_gb": 820,
+    "disk_total_gb": 894,
+    "valid": true
+  },
+  "vscode": {
+    "mem_mb": 6712,
+    "cpu_pct": 26,
+    "ext_count": 0,
+    "error_count": 1184,
+    "last_error": "C:/Users/someone/secret/path.log failed",
+    "valid": true
+  },
+  "env": {
+    "temp_c": 11,
+    "hi_c": 14,
+    "lo_c": 7,
+    "wcode": 3,
+    "loc": "Testville",
+    "has_weather": true,
+    "valid": true
+  },
+  "aurora": {
+    "pct": 0,
+    "kp_x10": 13,
+    "kpmax_x10": 17,
+    "cloud_pct": 100,
+    "night": false,
+    "valid": true
+  },
+  "ci": {
+    "state": "unknown",
+    "wf": "",
+    "branch": "",
+    "age_min": -1,
+    "review": 1,
+    "changes": 0,
+    "dirty": -1,
+    "ahead": 0,
+    "behind": 0,
+    "conflict": false,
+    "review_ok": true,
+    "total": 2,
+    "items": [
+      {
+        "state": "fail",
+        "repo": "example/repo",
+        "title": "Fix the thing",
+        "branch": "main",
+        "sha": "abc1234",
+        "workflow": "CI",
+        "job": "build",
+        "step": "compile",
+        "url": "https://github.com/example/repo/actions/runs/1",
+        "pr_url": "https://github.com/example/repo/pull/12",
+        "pr": 12,
+        "age": 5,
+        "failed": 1
+      },
+      {
+        "state": "review",
+        "repo": "example/other",
+        "title": "Sneaky",
+        "branch": "",
+        "sha": "",
+        "workflow": "",
+        "job": "",
+        "step": "",
+        "url": "javascript:alert(1)",
+        "pr_url": "",
+        "pr": 3,
+        "age": -1,
+        "failed": 0
+      }
+    ],
+    "valid": true
+  },
+  "today": {
+    "active_min": 8,
+    "tok_k": 1785,
+    "usd": 13,
+    "commits": 0,
+    "cp_used": -1,
+    "valid": true
+  },
+  "connectivity": {
+    "daemon_state": "",
+    "wifi_state": 2,
+    "wifi_ip": "192.0.2.10",
+    "screen": 0
+  },
+  "device": {
+    "uptime_s": 646,
+    "reset_reason": 1,
+    "heap_free": 71304,
+    "heap_min_free": 47452,
+    "max_alloc": 42996,
+    "max_alloc_min": 42996,
+    "loops": 95446,
+    "loop_avg_us": 1824,
+    "loop_max_us": 227109,
+    "lv_max_us": 113510,
+    "window_s": 645
+  },
+  "indoor": {
+    "present": true,
+    "temp_c": 22.4,
+    "pressure_hpa": 1013.2,
+    "humidity_pct": null
+  }
+}

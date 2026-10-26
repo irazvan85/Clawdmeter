@@ -27,3 +27,11 @@ daemon/.venv/
 # Python bytecode cache
 __pycache__/
 *.pyc
+
+# Cloud dashboard (cloud/) build output and local env
+cloud/node_modules/
+cloud/.next/
+cloud/next-env.d.ts
+cloud/*.tsbuildinfo
+cloud/.env*.local
+cloud/.vercel/
