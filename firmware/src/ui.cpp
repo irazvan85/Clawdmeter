@@ -2843,7 +2843,9 @@ void ui_cycle_screen(void) {
         else if (next == SCREEN_BLUETOOTH) next = SCREEN_CI;
         else if (next == SCREEN_CI)        next = SCREEN_TODAY;
         else if (next == SCREEN_TODAY)     next = SCREEN_CODEX;
-        else if (next == SCREEN_CODEX)     next = SCREEN_SPLASH;
+        else if (next == SCREEN_CODEX)     next = SCREEN_AIR;
+        else if (next == SCREEN_AIR)       next = SCREEN_GASES;
+        else if (next == SCREEN_GASES)     next = SCREEN_SPLASH;
         else                              next = SCREEN_CLOCK;  // from SPLASH (or first run)
         // Skip screens that have never received data from the daemon, or
         // that the user has hidden, so cycling only surfaces real content

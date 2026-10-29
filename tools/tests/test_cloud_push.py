@@ -13,13 +13,21 @@ import unittest
 from pathlib import Path
 
 import _util  # noqa: F401
-import cloud_push as cp
+
+try:
+    import cloud_push as cp
+except ImportError as e:     # httpx missing
+    cp = None
+    SKIP = f"cloud_push not importable: {e}"
+else:
+    SKIP = ""
 
 FIX = Path(__file__).resolve().parents[1] / "fixtures"
 STATE = json.loads((FIX / "device_state.json").read_text(encoding="utf-8"))
 SECRET = "s" * 40
 
 
+@unittest.skipIf(cp is None, SKIP)
 class Snapshot(unittest.TestCase):
     def test_fixture_is_current(self):
         snap = cp.build_snapshot(STATE, cp.DEFAULT_SECTIONS + cp.OPTIONAL_SECTIONS, 1793000000)
@@ -55,6 +63,7 @@ class Snapshot(unittest.TestCase):
             cp.parse_sections("weather, everything")
 
 
+@unittest.skipIf(cp is None, SKIP)
 class Signing(unittest.TestCase):
     def test_matches_server_scheme(self):
         body = b'{"v":1}'
@@ -63,6 +72,7 @@ class Signing(unittest.TestCase):
         self.assertEqual((h["X-Clawd-Ts"], h["X-Clawd-Sig"]), ("1700000000", want))
 
 
+@unittest.skipIf(cp is None, SKIP)
 class Config(unittest.TestCase):
     def test_disabled_without_url(self):
         self.assertIsNone(cp.CloudPush.from_config({}, log=lambda m: None))
@@ -83,6 +93,7 @@ class Config(unittest.TestCase):
             {"cloud_url": "http://localhost:3000", "cloud_secret": SECRET}, log=lambda m: None))
 
 
+@unittest.skipIf(cp is None, SKIP)
 class Backoff(unittest.TestCase):
     def test_backs_off_when_state_unavailable(self):
         p = cp.CloudPush("https://x.vercel.app", SECRET, cp.DEFAULT_SECTIONS, log=lambda m: None)

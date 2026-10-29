@@ -9,6 +9,7 @@ the device.
   screen-enum       ui.h's screen_t enum vs SCREEN_COUNT (15)
   cycle-order       ui.cpp CYCLE_ORDER[] == device_config.cpp CFG_SCREEN_ORDER[]
                     (bit i of the visibility mask means CYCLE_ORDER[i])
+  cycle-chain       ui_cycle_screen()'s if/else chain visits CYCLE_ORDER[] then Splash
   required-bits     device_config.cpp CLOCK_BIT/CONN_BIT point at Clock/Connectivity
   web-screen-names  index.html SCREEN_NAMES[] has one entry per screen_t value
   web-cfg-screens   index.html CFG_SCREENS[] bits/labels match CFG_SCREEN_ORDER[]
@@ -106,6 +107,25 @@ def check_cycle_order() -> list[str]:
     return errs
 
 
+def check_cycle_chain() -> list[str]:
+    # ui_cycle_screen() walks a hand-written if/else chain, not CYCLE_ORDER[],
+    # so a screen appended to the arrays but not the chain is silently
+    # unreachable by the button (Air/Gases were, until this check existed).
+    s = _strip_comments(_read(SRC / "ui.cpp"))
+    m = re.search(r"void\s+ui_cycle_screen\s*\(\s*void\s*\)\s*\{(.*?)\n\}", s, re.S)
+    if not m:
+        return ["ui_cycle_screen() not found in ui.cpp"]
+    step = dict(re.findall(r"next\s*==\s*(SCREEN_\w+)\s*\)\s*next\s*=\s*(SCREEN_\w+)", m.group(1)))
+    walk, cur = [], "SCREEN_CLOCK"
+    while cur in step and len(walk) <= len(step):
+        walk.append(cur)
+        cur = step[cur]
+    want = parse_c_array(SRC / "ui.cpp", "CYCLE_ORDER")
+    if walk != want or cur != "SCREEN_SPLASH":
+        return [f"ui_cycle_screen() visits {walk} -> {cur}\n   expected CYCLE_ORDER {want} -> SCREEN_SPLASH"]
+    return []
+
+
 def check_required_bits() -> list[str]:
     order = parse_c_array(SRC / "device_config.cpp", "CFG_SCREEN_ORDER")
     s = _read(SRC / "device_config.cpp")
@@ -186,6 +206,7 @@ def check_splash_index() -> list[str]:
 CHECKS = {
     "screen-enum": check_screen_enum,
     "cycle-order": check_cycle_order,
+    "cycle-chain": check_cycle_chain,
     "required-bits": check_required_bits,
     "web-screen-names": check_web_screen_names,
     "web-cfg-screens": check_web_cfg_screens,
