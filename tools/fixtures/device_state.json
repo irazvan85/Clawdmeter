@@ -181,7 +181,21 @@
     "loop_avg_us": 1824,
     "loop_max_us": 227109,
     "lv_max_us": 113510,
-    "window_s": 645
+    "window_s": 645,
+    "last_reset": {
+      "boot": 42,
+      "reason": 1,
+      "reason_name": "poweron",
+      "prev_src": "nvs",
+      "prev": {
+        "uptime_s": 1834,
+        "screen": 14,
+        "heap_free": 61204,
+        "heap_min_free": 45264,
+        "max_alloc": 42996,
+        "max_alloc_min": 38900
+      }
+    }
   },
   "indoor": {
     "present": true,

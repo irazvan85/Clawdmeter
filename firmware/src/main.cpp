@@ -18,6 +18,7 @@
 #include "device_config.h"
 #include "discovery.h"
 #include "perf.h"
+#include "reset_info.h"
 
 // Physical buttons:
 //   BTN_BACK  (GPIO 0 / BOOT) — cycle screens (splash→usage→bluetooth→usage…)
@@ -446,7 +447,9 @@ void build_state_json(JsonDocument& doc) {
 
     // Heap/loop-timing counters (perf.h) -- no secrets, safe on this
     // unauthenticated route. tools/perf_check.py reads these.
-    perf_to_json(doc["device"].to<JsonObject>());
+    JsonObject dev = doc["device"].to<JsonObject>();
+    perf_to_json(dev);
+    reset_info_to_json(dev["last_reset"].to<JsonObject>());
 }
 
 bool device_ingest_payload(const char* raw) {
@@ -548,6 +551,9 @@ static void check_serial_cmd() {
                 po["wifi_ip"]    = wifi_get_ip();
                 serializeJson(pd, Serial);
                 Serial.println();
+            } else if (strcmp(cmd_buf, "reset") == 0) {
+                // Reset reason of this boot + the previous run's last snapshot.
+                reset_info_print();
             } else if (strcmp(cmd_buf, "perf reset") == 0) {
                 perf_reset();
                 Serial.println("perf reset");
@@ -626,6 +632,10 @@ void setup() {
     // the opens above. Its screen is built lazily, only once a reading shows
     // something is actually wired to the pin.
     gas_sensor_init();
+
+    // Why the last boot ended + what the previous run was doing (screen,
+    // heap low-water marks). One small NVS open, same early slot as above.
+    reset_info_init();
 
     // Loads the persisted theme/visibility settings (Preferences NVS open,
     // same class of call as the two just above) and sets g_theme -- must run
@@ -841,6 +851,8 @@ void loop() {
 
     // Check for serial commands (screenshot, etc.)
     check_serial_cmd();
+
+    reset_info_tick();
 
     perf_loop_end();   // before delay(): measures work, not the idle sleep
     delay(5);

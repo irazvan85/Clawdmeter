@@ -42,6 +42,14 @@ sensor_hist.{h,cpp} — 24 h ring buffer of sensor readings (96 × 15 min), pers
 usage_hist.{h,cpp}  — 24 h ring buffer of Claude session/weekly usage % (same
                        design as sensor_hist, kept as a sibling module — see
                        usage_hist.h for why), feeds the Usage screen sparklines
+reset_info.{h,cpp} — restart forensics: esp_reset_reason() of this boot plus
+                   the previous run's last snapshot (uptime, screen, heap
+                   free/min, largest block/min). RTC_NOINIT copy refreshed
+                   every second (exact for panic/WDT/brownout/sw resets), NVS
+                   copy (namespace "rst") at 30 s, 120 s, then every 5 min --
+                   the fallback for a power-on/EN reset, which wipes RTC.
+                   Serial `reset`, boot log line, GET /api/state
+                   device.last_reset.
 imu.{h,cpp}     — stub: imu_get_rotation() always returns 0
 power.{h,cpp}   — stub: battery=-1, charging=false, pwr_pressed=false
 device_config.{h,cpp} — web-configurable theme + screen-visibility settings
@@ -181,7 +189,7 @@ The `run` project skill (`.claude/skills/run/SKILL.md`) has the full build/flash
 
 The firmware ships a `screenshot` serial command that dumps the LVGL framebuffer over the serial port. `./screenshot.sh out.png COM13` (or the Windows equivalent) captures a 135×240 PNG. **Use this on every UI iteration** — read the PNG, verify visually, iterate.
 
-The boot screen is `SCREEN_SPLASH` and only advances on a physical button press. To screenshot a different screen without asking the user to press a button, **temporarily change the default boot screen** in `main.cpp` (search for `ui_show_screen(SCREEN_SPLASH);`) to any value from the `screen_t` enum (see Screens above), iterate, then revert before committing. Alternatively, use the serial QA commands without touching code: `screen <N>` jumps to a screen index directly, and `feed <json>` injects a payload (e.g. `feed {"src":"ci","state":"fail",...}`) as if it arrived over BLE — see `check_serial_cmd()` in `main.cpp` for the full command list (`token`, `cfg`, `cycle`, `timer`, `gas`, `gascal`, `gasauto`, `histfill`, `histclear`, `uhistfill`, `uhistclear`, `i2cscan`, `gpiotest`, `perf`, `perf reset`).
+The boot screen is `SCREEN_SPLASH` and only advances on a physical button press. To screenshot a different screen without asking the user to press a button, **temporarily change the default boot screen** in `main.cpp` (search for `ui_show_screen(SCREEN_SPLASH);`) to any value from the `screen_t` enum (see Screens above), iterate, then revert before committing. Alternatively, use the serial QA commands without touching code: `screen <N>` jumps to a screen index directly, and `feed <json>` injects a payload (e.g. `feed {"src":"ci","state":"fail",...}`) as if it arrived over BLE — see `check_serial_cmd()` in `main.cpp` for the full command list (`token`, `cfg`, `cycle`, `timer`, `gas`, `gascal`, `gasauto`, `histfill`, `histclear`, `uhistfill`, `uhistclear`, `i2cscan`, `gpiotest`, `perf`, `perf reset`, `reset`).
 
 ## Critical gotchas
 
