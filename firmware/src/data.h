@@ -122,6 +122,10 @@ enum AirHint { AIR_HINT_NONE, AIR_HINT_SPIKE, AIR_HINT_SLOW };
 // Order of AirData::gas_ppm[] / gas_level[], and of GAS_DEFS[] in gas_sensor.cpp.
 enum AirGas { GAS_CO2, GAS_NH3, GAS_ALCOHOL, GAS_TOLUENE, GAS_ACETONE, GAS_CO, AIR_GAS_COUNT };
 
+// Raw-signal quality from gas_signal.h: UNSTABLE = jumping around (loose
+// wiring) or no baseline yet; FLOOR = output below the ADC's range.
+enum AirSignal { AIR_SIG_OK, AIR_SIG_UNSTABLE, AIR_SIG_FLOOR };
+
 struct AirData {
     bool     present;      // false = nothing on the pin (reads ~0 V)
     bool     warming;      // heater still settling after boot; numbers not trusted yet
@@ -131,6 +135,7 @@ struct AirData {
     float    ratio;        // Rs / R0 — 1.0 = baseline clean air, lower = dirtier
     AirLevel level;        // from ratio alone — gas-agnostic headline
     bool     saturated;    // output pinned at the ADC/supply ceiling — off-scale
+    AirSignal signal;      // raw signal quality; numbers aren't trusted unless OK
     AirHint  hint;
     // Per-gas *equivalents*: what each gas would read if it alone caused the
     // drop. One sensor, one reading -- these move together, not independently.

@@ -18,6 +18,7 @@
 #include "device_config.h"
 #include "discovery.h"
 #include "perf.h"
+#include "reset_info.h"
 
 // Physical buttons:
 //   BTN_BACK  (GPIO 0 / BOOT) — cycle screens (splash→usage→bluetooth→usage…)
@@ -287,6 +288,7 @@ void build_state_json(JsonDocument& doc) {
         bool ok = gas_sensor_get(&a);
         static const char* const LEVELS[] = { "good", "fair", "poor", "bad" };
         static const char* const HINTS[]  = { "", "spike", "slow" };
+        static const char* const SIGNALS[] = { "ok", "unstable", "floor" };
         JsonObject air = doc["air"].to<JsonObject>();
         air["present"]    = ok && a.present;
         air["warming"]    = a.warming;
@@ -295,6 +297,7 @@ void build_state_json(JsonDocument& doc) {
         air["ratio"]      = roundf(a.ratio * 1000) / 1000;
         air["level"]      = LEVELS[a.level];
         air["saturated"]  = a.saturated;
+        air["signal"]     = SIGNALS[a.signal];
         air["hint"]       = HINTS[a.hint];
         // Per-gas equivalents of the one reading -- see gas_sensor.h.
         JsonObject gases = air["gases"].to<JsonObject>();
@@ -444,7 +447,9 @@ void build_state_json(JsonDocument& doc) {
 
     // Heap/loop-timing counters (perf.h) -- no secrets, safe on this
     // unauthenticated route. tools/perf_check.py reads these.
-    perf_to_json(doc["device"].to<JsonObject>());
+    JsonObject dev = doc["device"].to<JsonObject>();
+    perf_to_json(dev);
+    reset_info_to_json(dev["last_reset"].to<JsonObject>());
 }
 
 bool device_ingest_payload(const char* raw) {
@@ -546,6 +551,9 @@ static void check_serial_cmd() {
                 po["wifi_ip"]    = wifi_get_ip();
                 serializeJson(pd, Serial);
                 Serial.println();
+            } else if (strcmp(cmd_buf, "reset") == 0) {
+                // Reset reason of this boot + the previous run's last snapshot.
+                reset_info_print();
             } else if (strcmp(cmd_buf, "perf reset") == 0) {
                 perf_reset();
                 Serial.println("perf reset");
@@ -560,12 +568,16 @@ static void check_serial_cmd() {
                 gas_sensor_print();
             } else if (strcmp(cmd_buf, "gascal") == 0) {
                 // Run in fresh air (window open / outdoors), after burn-in.
-                Serial.println(gas_sensor_calibrate(true) == GAS_CAL_OK
-                                   ? "gas baseline set" : "gas: no sensor reading");
+                switch (gas_sensor_calibrate(true)) {
+                case GAS_CAL_OK:       Serial.println("gas baseline set"); break;
+                case GAS_CAL_UNSTABLE: Serial.println("gas: signal unstable (check wiring) - not calibrated"); break;
+                case GAS_CAL_FLOOR:    Serial.println("gas: reading at ADC floor (check wiring/divider) - not calibrated"); break;
+                default:               Serial.println("gas: no sensor reading"); break;
+                }
                 gas_sensor_print();
             } else if (strcmp(cmd_buf, "gasauto") == 0) {
                 gas_sensor_auto();
-                Serial.println("gas baseline back to auto-tracking");
+                Serial.println("gas baseline cleared - re-learning from the next steady reading");
             } else if (strcmp(cmd_buf, "histclear") == 0) {
                 sensor_hist_clear();
                 Serial.println("sensor history cleared");
@@ -620,6 +632,10 @@ void setup() {
     // the opens above. Its screen is built lazily, only once a reading shows
     // something is actually wired to the pin.
     gas_sensor_init();
+
+    // Why the last boot ended + what the previous run was doing (screen,
+    // heap low-water marks). One small NVS open, same early slot as above.
+    reset_info_init();
 
     // Loads the persisted theme/visibility settings (Preferences NVS open,
     // same class of call as the two just above) and sets g_theme -- must run
@@ -745,9 +761,11 @@ void loop() {
                 // Calibrate the MQ-135 baseline to the air right now.
                 ui_flash_feedback_strong();
                 GasCalResult r = gas_sensor_calibrate(false);
-                ui_show_notice(r == GAS_CAL_OK      ? "Baseline set"
-                             : r == GAS_CAL_WARMING ? "Still warming"
-                                                    : "No sensor", r == GAS_CAL_OK);
+                ui_show_notice(r == GAS_CAL_OK       ? "Baseline set"
+                             : r == GAS_CAL_WARMING  ? "Still warming"
+                             : r == GAS_CAL_UNSTABLE ? "Unstable signal"
+                             : r == GAS_CAL_FLOOR    ? "Signal too low"
+                                                     : "No sensor", r == GAS_CAL_OK);
             } else {
                 ui_flash_feedback_strong();
             }
@@ -823,7 +841,8 @@ void loop() {
         if (millis() - ui_ms >= 2000 && gas_sensor_get(&air)) {
             ui_ms = millis();
             ui_update_air(&air);
-            if (air.present && !air.warming && millis() - hist_ms >= 10000) {
+            if (air.present && !air.warming && air.signal == AIR_SIG_OK &&
+                millis() - hist_ms >= 10000) {
                 hist_ms = millis();
                 sensor_hist_sample_aq(air.ratio);
             }
@@ -832,6 +851,8 @@ void loop() {
 
     // Check for serial commands (screenshot, etc.)
     check_serial_cmd();
+
+    reset_info_tick();
 
     perf_loop_end();   // before delay(): measures work, not the idle sleep
     delay(5);

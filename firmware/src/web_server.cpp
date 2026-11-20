@@ -146,7 +146,10 @@ static void handle_gas_post() {
     int code = 200;
     if (action == "cal") {
         GasCalResult r = gas_sensor_calibrate(false);
-        result = r == GAS_CAL_OK ? "ok" : r == GAS_CAL_WARMING ? "warming" : "no_sensor";
+        result = r == GAS_CAL_OK       ? "ok"
+               : r == GAS_CAL_WARMING  ? "warming"
+               : r == GAS_CAL_UNSTABLE ? "unstable"
+               : r == GAS_CAL_FLOOR    ? "floor" : "no_sensor";
         if (r != GAS_CAL_OK) code = 409;
         else                 ui_show_notice("Baseline set", true);
     } else if (action == "auto") {
