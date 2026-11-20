@@ -7,6 +7,7 @@
     "ratio": 3.824,
     "level": "good",
     "saturated": false,
+    "signal": "ok",
     "hint": "spike",
     "gases": {
       "co2": {

@@ -1,5 +1,6 @@
 #include "gas_sensor.h"
 #include "env_sensor.h"
+#include "gas_signal.h"
 #include <Arduino.h>
 #include <Preferences.h>
 #include <math.h>
@@ -29,6 +30,7 @@ float    r_slow      = 0;       // ~10-min EMA of r_now, for the hint
 bool     calibrated  = false;
 bool     r0_dirty    = false;
 uint32_t r0_saved_ms = 0;
+GasSignal sig;                  // last 30 raw samples, for the stability gate
 
 // Temp/humidity dependence of the MQ-135, normalised to 20 C / 33 %RH — the
 // fit popularised by the GeorgK MQ135 library from the datasheet's Fig. 4.
@@ -51,6 +53,8 @@ void save_r0(void) {
 }
 
 bool is_present(void)  { return sampled && mv_ema >= GAS_ABSENT_MV; }
+bool is_saturated(void) { return pin_mv >= GAS_SAT_PIN_MV || mv_ema >= GAS_SAT_MV; }
+bool signal_usable(void) { return gas_signal_state(&sig) == GAS_SIG_OK; }
 bool is_warming(void)  { return millis() < GAS_WARMUP_S * 1000UL; }
 
 float ratio_now(void) { return (r0 > 0 && r_now > 0) ? r_now / r0 : 1.0f; }
@@ -115,6 +119,7 @@ void gas_sensor_tick(void) {
     for (int i = 0; i < GAS_OVERSAMPLE; i++) sum += analogReadMilliVolts(GAS_PIN);
     pin_mv = (int)(sum / GAS_OVERSAMPLE);
     float mv = pin_mv * GAS_DIVIDER;
+    gas_signal_push(&sig, mv, pin_mv);   // raw, not the EMA -- dropouts must show
 
     mv_ema  = sampled ? mv_ema + GAS_EMA_ALPHA * (mv - mv_ema) : mv;
     sampled = true;
@@ -127,8 +132,10 @@ void gas_sensor_tick(void) {
     r_slow = (r_slow > 0) ? r_slow + GAS_SLOW_ALPHA * (r_now - r_slow) : r_now;
 
     // Auto baseline: the cleanest (highest-resistance) air seen since the
-    // heater settled. Pinned once `gascal` has been run.
-    if (!calibrated && !is_warming() && r_now > r0) {
+    // heater settled. Pinned once `gascal` has been run. Only from a steady,
+    // on-scale signal -- one dropout to the ADC floor reads as huge
+    // resistance and would otherwise become R0 for good.
+    if (!calibrated && !is_warming() && signal_usable() && !is_saturated() && r_now > r0) {
         r0 = r_now;
         r0_dirty = true;
     }
@@ -143,7 +150,12 @@ bool gas_sensor_get(AirData* out) {
     out->calibrated  = calibrated;
     out->mv          = (int)lroundf(mv_ema);
     out->ratio       = ratio_now();
-    out->saturated   = pin_mv >= GAS_SAT_PIN_MV || mv_ema >= GAS_SAT_MV;
+    out->saturated   = is_saturated();
+    // No baseline yet (fresh `gasauto`) means ratio_now() is a placeholder 1.0
+    // -- report it as not trusted rather than as "Good".
+    GasSignalState st = gas_signal_state(&sig);
+    out->signal = st == GAS_SIG_FLOOR ? AIR_SIG_FLOOR
+                : st == GAS_SIG_UNSTABLE || r0 <= 0 ? AIR_SIG_UNSTABLE : AIR_SIG_OK;
 
     // Headline: the ratio itself, no gas assumed.
     float r = out->ratio;
@@ -156,7 +168,8 @@ bool gas_sensor_get(AirData* out) {
     // (sanitizer, cooking, spray). Down for a while with no spike = air has
     // gone stale gradually (people, poor ventilation). Educated guesses.
     out->hint = AIR_HINT_NONE;
-    if (!out->warming && out->present && r_slow > 0) {
+    // Not on a bad signal: on 2026-10-29 dropouts fired the spike hint.
+    if (!out->warming && out->present && r_slow > 0 && out->signal == AIR_SIG_OK) {
         if (r_now < r_slow * GAS_SPIKE_DROP) out->hint = AIR_HINT_SPIKE;
         else if (r < 0.85f)                  out->hint = AIR_HINT_SLOW;
     }
@@ -171,11 +184,12 @@ bool gas_sensor_get(AirData* out) {
 void gas_sensor_print(void) {
     AirData a;
     if (!gas_sensor_get(&a)) { Serial.println("gas: no sample yet"); return; }
-    Serial.printf("gas: pin=%dmV S=%dmV Rs/RL=%.3f R0=%.3f (%s) ratio=%.3f level=%d hint=%d%s%s%s\n",
+    Serial.printf("gas: pin=%dmV S=%dmV Rs/RL=%.3f R0=%.3f (%s) ratio=%.3f level=%d hint=%d%s%s%s%s\n",
                   pin_mv, a.mv, (double)r_now, (double)r0,
                   calibrated ? "cal" : "auto", (double)a.ratio, (int)a.level, (int)a.hint,
                   a.present ? "" : " ABSENT", a.warming ? " warming" : "",
-                  a.saturated ? " SATURATED" : "");
+                  a.saturated ? " SATURATED" : "",
+                  a.signal == AIR_SIG_UNSTABLE ? " UNSTABLE" : a.signal == AIR_SIG_FLOOR ? " FLOOR" : "");
     Serial.print("     ");
     for (int i = 0; i < AIR_GAS_COUNT; i++)
         Serial.printf(" %s=%.1f", GAS_DEFS[i].key, (double)a.gas_ppm[i]);
@@ -185,6 +199,11 @@ void gas_sensor_print(void) {
 GasCalResult gas_sensor_calibrate(bool allow_warming) {
     if (!is_present() || !(r_now > 0)) return GAS_CAL_NO_SENSOR;
     if (!allow_warming && is_warming()) return GAS_CAL_WARMING;
+    switch (gas_signal_state(&sig)) {
+    case GAS_SIG_FLOOR:    return GAS_CAL_FLOOR;
+    case GAS_SIG_UNSTABLE: return GAS_CAL_UNSTABLE;
+    default:               break;
+    }
     r0 = r_now;
     calibrated = true;
     save_r0();
@@ -193,6 +212,8 @@ GasCalResult gas_sensor_calibrate(bool allow_warming) {
 
 void gas_sensor_auto(void) {
     calibrated = false;
-    r0 = is_present() ? r_now : 0;
+    // Cleared, not set to r_now: the current reading may be the bad one. The
+    // next steady sample re-establishes R0 through gas_sensor_tick().
+    r0 = 0;
     save_r0();
 }

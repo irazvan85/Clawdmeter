@@ -43,6 +43,8 @@ void gas_sensor_print(void);          // raw mV, Rs/RL, R0, ratio + every gas eq
 // allow_warming: the serial path passes true, because opening the port resets
 // the ESP32 (restarting the warm-up clock) without cutting the heater's 5V.
 // The button/HTTP paths pass false -- for them "warming" means a real cold start.
-enum GasCalResult { GAS_CAL_OK, GAS_CAL_NO_SENSOR, GAS_CAL_WARMING };
+// Every path also needs the last 30 s of signal steady and above the ADC floor
+// (gas_signal.h), else UNSTABLE / FLOOR and R0 is left alone.
+enum GasCalResult { GAS_CAL_OK, GAS_CAL_NO_SENSOR, GAS_CAL_WARMING, GAS_CAL_UNSTABLE, GAS_CAL_FLOOR };
 GasCalResult gas_sensor_calibrate(bool allow_warming);
-void gas_sensor_auto(void);           // drop the pinned R0, back to auto-tracking
+void gas_sensor_auto(void);           // clear R0, re-learn it from the next steady reading
